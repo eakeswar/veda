@@ -799,6 +799,22 @@ export async function fetchSemanticAnalysis(sourceText, fallbackTitle = '', isDi
   return null
 }
 
+export async function fetchTranslatedFields(deck, fields = ['highlights', 'supportingPoints'], language = 'te-IN') {
+  if (!deck) return null
+  try {
+    const apiBase = import.meta.env.VITE_LAYOUT_API_URL || 'http://127.0.0.1:8765'
+    const response = await fetch(`${apiBase}/translate_fields`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ deck, fields, language }),
+    })
+    if (!response.ok) return null
+    return await response.json()
+  } catch {
+    return null
+  }
+}
+
 export async function fetchTeluguDeck(deck, options = {}) {
   const { onSarvamCreditsExhausted } = options
   if (!deck) return null

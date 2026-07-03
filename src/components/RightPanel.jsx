@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { usePDF, notifySarvamCreditsExhausted } from '../context/PDFContext'
-import { extractPagePresentation, extractPageText, fetchSemanticAnalysis, fetchTeluguDeck, upscaleImages } from '../utils/pdfUtils'
+import { extractPagePresentation, extractPageText, fetchSemanticAnalysis, fetchTeluguDeck, fetchTranslatedFields, upscaleImages } from '../utils/pdfUtils'
 import { requestCloudTTS, requestCloudTTSBoundaries, getTTSStreamUrl, supportsCloudTTS } from '../utils/speechUtils'
 import { cn } from '../lib/cn'
 import AIAvatar from './AIAvatar'
@@ -1012,8 +1012,8 @@ export default function RightPanel({ sidebarOpen, onToggleSidebar }) {
 
             // Apply any already-upscaled images before displaying the final deck,
             // then kick off upscaling for any new images the LLM deck may have introduced.
-            finalDeck = applyUpscaledImages(finalDeck, upscaledUrlMapRef.current)
             startUpscaling(finalDeck)
+            finalDeck = applyUpscaledImages(finalDeck, upscaledUrlMapRef.current)
 
             // In Telugu mode, this is the FIRST time we show the deck (skeleton → Telugu)
             if (!showImmediately) {
@@ -1028,6 +1028,18 @@ export default function RightPanel({ sidebarOpen, onToggleSidebar }) {
               setPageDeck(finalDeck)
             } else {
               setPendingSemanticDeck(finalDeck)
+            }
+
+            // Secondary fields (highlights, supportingPoints) were skipped during /analyze
+            // for speed. Translate them lazily now that the slide is visible.
+            if (state.language === 'te-IN') {
+              fetchTranslatedFields(finalDeck, ['highlights', 'supportingPoints'], state.language)
+                .then((enriched) => {
+                  if (!enriched || isCancelled) return
+                  setPageDeck(enriched)
+                  setPageCache((prev) => ({ ...prev, [semanticCacheKey]: enriched }))
+                })
+                .catch(() => {})
             }
           })
           .catch((err) => {

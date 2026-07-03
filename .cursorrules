@@ -86,14 +86,17 @@ veda/
 - Fallback: Sarvam Translate API if NLLB-200 fails or is not yet loaded
 - All translation calls go through translate_strings_indictrans2() first
 
-### Image Extraction (/page_layout)
-- Uses PyMuPDF get_text("dict") to extract image blocks
-- Images returned with: url (base64), x, y, w, h, cx, cy (centre coordinates)
-- Coordinate system: bottom-up (y = height - bbox_bottom), same as text lines
-- Filters applied before returning:
-  - Skip images with near-zero dimensions (w < 5 or h < 5) — invisible artifacts
-  - Skip images smaller than 80×80 — decorative icons, bullets, small logos
-  - Skip images wider than 80% of page width — full-page backgrounds and decorative banners
+### Text + Image Extraction (/page_layout)
+- **Text**: extracted by `_extract_lines_pdfplumber()` (pdfplumber + pdfminer.six in vendor/)
+  - Column-aware reading order: detects horizontal gutter (gap ≥ 3% of page width) → 2-column layout
+  - Primary column = the column with more words (goes first); secondary column (sidebar) goes last
+  - Image-zone filtering: words overlapping an image rect by > 30% of word width are dropped
+  - Header/footer filtering: same rules as PyMuPDF path (margin zone + running header set)
+  - Fallback: `_extract_lines_pymupdf()` (old get_text("dict") path) if pdfplumber fails
+- **Images**: extracted by PyMuPDF `page.get_images(full=True)` + `get_image_rects(xref)`
+  - Returns: url (base64), x, y (bottom-up), w, h, cx, cy (centre coordinates)
+  - Filters: skip w/h < 5 (artifacts), skip w/h < 50 (decorative icons), skip w > 90% page width (backgrounds)
+  - Deduplication by xref to avoid double-counting shared image resources
 
 ### Known Issues / Things to Watch
 1. SarvamMemoryCache is single-entry only — second unique request evicts the first
@@ -139,11 +142,22 @@ veda/
 - Image matching (matchImagesToTopicsGlobal) uses vertical zone assignment:
   each topic owns the vertical band between its heading and the next heading
 
+### Image-Primary Pages (pdfUtils.js)
+- Pages with images but < 50 words (covers, ads, photo spreads) bypass topic detection and LLM
+- Returned immediately as `isImagePrimary: true` slide with the image as the main visual
+- LLM skip threshold in fetchSemanticAnalysis also set to 50 words (was 30)
+
+### Heading Detection (detectTopics in pdfUtils.js)
+- Uses font-size gap clustering: finds the largest jump between consecutive unique font sizes
+- Threshold = midpoint of that gap — catches real headlines, skips pull quotes and captions
+- Fallback to `max(median * 1.35, maxFontSize * 0.50)` when no clear gap exists (< 2pt jump)
+
 ### mergeSemanticDeck (RightPanel.jsx)
 - Called when LLM analysis (background) completes to merge into the fast heuristic result
-- For digest topics: uses Jaccard title-similarity to re-match images from heuristic topics
-  to LLM topics (LLM may reorder topics by importance, not page position)
+- For digest topics: uses Jaccard title-similarity on `title_en` (original English title, preserved
+  by backend before translation) to re-match images from heuristic topics to LLM topics
 - titleSimilarity() uses word-overlap (Jaccard) between topic titles
+- Positional fallback if all similarity scores are zero
 
 ---
 
@@ -168,10 +182,13 @@ LOCAL_LLM_SIZE=3B              # Options: 0.5B, 1.5B, 3B — currently 3B
 
 ## Installed Dependencies (server/vendor/)
 - fastapi, uvicorn, edge-tts — core backend
-- pymupdf (fitz) — PDF parsing
+- pymupdf (fitz) — PDF parsing + image extraction
+- pdfplumber, pdfminer.six — layout-aware text extraction (column detection, image-zone filtering)
+  - cryptography + cffi installed system-wide (not in vendor) — required by pdfminer.six
 - llama-cpp-python — local LLM inference
-- torch (CPU build) — required for NLLB-200 translation
+- torch (CPU build) — required for NLLB-200 translation and Real-ESRGAN upscaling
 - transformers, sentencepiece, sacremoses — NLLB-200 model loading and tokenization
+- Pillow, opencv-python-headless, torchvision — image processing for /upscale_image
 - requests, python-dotenv, httpx — HTTP and config
 - elevenlabs, openai — optional TTS/STT alternatives
 
@@ -181,6 +198,15 @@ LOCAL_LLM_SIZE=3B              # Options: 0.5B, 1.5B, 3B — currently 3B
 1. **Zoro avatar video** — HeyGen Talking Photo API (New_Zoro.png + Sarvam audio → talking video)
 2. **Video caching** — Cache by slide_id + language key, serve from /videos/{filename}
 3. **GPU inference** — n_gpu_layers=-1 for llama-cpp when GPU is available
+
+## PDF Layout Improvements — DONE (Jul 3 2026)
+- pdfplumber replaces PyMuPDF get_text("dict") for text extraction in /page_layout
+- 2-column detection: horizontal gap scan in middle 40% of page, gutter threshold = 3% of page width
+- Primary column ordering: column with more words goes first (article body before sidebar)
+- Image-zone text filtering: words overlapping images by > 30% of word width are excluded
+- Font-size gap clustering for heading detection in detectTopics() (pdfUtils.js)
+- Image-primary page handling for cover/ad/photo pages (< 50 words + images)
+- Tested against Discovery Nov 2021 (97 pages): 61 single-col, 12 two-col, 14 image-heavy, 10 covers
 
 ## Image Upscaling (Real-ESRGAN) — DONE (Jul 2 2026)
 - `/upscale_image` POST endpoint in tts_server.py

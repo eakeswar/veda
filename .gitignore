@@ -66,3 +66,7 @@ Desktop.ini
 server/models/
 models/
 *.gguf
+*.pth
+
+# GFPGAN/facexlib download cache (weights auto-downloaded at runtime)
+gfpgan/

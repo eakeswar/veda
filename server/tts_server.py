@@ -7,6 +7,14 @@ import os
 import re
 import sys
 import threading
+
+# Windows console defaults to cp1252 which can't encode most Unicode characters.
+# Reconfigure stdout/stderr to UTF-8 so LLM output with arrows, dashes, etc. never
+# crashes a print() call and kills the request handler.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 import fitz
 import wave
 from io import BytesIO
@@ -551,9 +559,9 @@ INDICTRANS_LANG_MAP = {
     "mr-IN": "mar_Deva",
 }
 
-# NLLB-200 (facebook/nllb-200-distilled-600M) — works on CPU, no C extensions required.
+# NLLB-200 (facebook/nllb-200-1.3B) — works on CPU, no C extensions required.
 # Replaces IndicTrans2/IndicTransToolkit which requires MSVC build tools on Windows.
-NLLB_MODEL_NAME = "facebook/nllb-200-distilled-600M"
+NLLB_MODEL_NAME = "facebook/nllb-200-1.3B"
 
 class IndicTransState:
     _model = None
@@ -574,7 +582,7 @@ class IndicTransState:
                     f"transformers not installed: {e}. "
                     "Run: pip install --target server/vendor transformers sentencepiece"
                 )
-            print(f"Loading NLLB-200 translation model ({NLLB_MODEL_NAME}) — first load takes 2-3 minutes...")
+            print(f"Loading NLLB-200 translation model ({NLLB_MODEL_NAME}) — first load downloads ~2.5GB and may take a few minutes...")
             cls._tokenizer = AutoTokenizer.from_pretrained(NLLB_MODEL_NAME)
             cls._model = AutoModelForSeq2SeqLM.from_pretrained(NLLB_MODEL_NAME)
             print("NLLB-200 translation model loaded successfully.")
@@ -583,26 +591,38 @@ class IndicTransState:
 def translate_strings_indictrans2(texts: list[str], target_lang: str = "tel_Telu") -> list[str]:
     """Translate a list of English strings to target_lang using NLLB-200 locally."""
     import torch
+    import time
     model, tokenizer = IndicTransState.get_model()
     tokenizer.src_lang = "eng_Latn"
     inputs = tokenizer(texts, return_tensors="pt", padding=True, truncation=True, max_length=256)
     target_lang_id = tokenizer.convert_tokens_to_ids(target_lang)
     if target_lang_id == tokenizer.unk_token_id:
         raise ValueError(f"Unknown target language code for NLLB-200: {target_lang}")
+    # Dynamic max_length: 3× the longest input's word count + 20 buffer, capped at 200.
+    # Narration is now capped at 70 words → output ~230 tokens → 200 is sufficient.
+    input_max_words = max(len(t.split()) for t in texts)
+    dynamic_max_length = min(input_max_words * 3 + 20, 200)
+
+    t0 = time.perf_counter()
     with torch.no_grad():
         outputs = model.generate(
             **inputs,
             forced_bos_token_id=target_lang_id,
-            num_beams=4,
-            max_length=256
+            num_beams=2,
+            max_length=dynamic_max_length,
+            length_penalty=1.0,
+            early_stopping=True,
         )
+    elapsed = time.perf_counter() - t0
     result = tokenizer.batch_decode(outputs, skip_special_tokens=True)
-    print(f"NLLB-200 translated {len(texts)} strings to {target_lang}")
+    print(f"NLLB-200 translated {len(texts)} strings to {target_lang} in {elapsed:.1f}s (max_len={dynamic_max_length})")
     return result
 
 ESRGAN_MODEL_PATH = BASE_DIR / "models" / "RealESRGAN_x4plus.pth"
 ESRGAN_TILE_SIZE = 256   # Process this many pixels at a time; keeps RAM ~1GB on CPU
 ESRGAN_TILE_PAD  = 10    # Overlap between tiles to avoid edge seams
+
+GFPGAN_MODEL_PATH = BASE_DIR / "models" / "GFPGANv1.4.pth"
 
 class ESRGANState:
     """Lazy-load singleton for the Real-ESRGAN 4× upscaler."""
@@ -628,6 +648,67 @@ class ESRGANState:
             print("Real-ESRGAN model loaded.")
             cls._model = model
             return cls._model
+
+
+class GFPGANState:
+    """Lazy-load singleton for the GFPGAN face restoration enhancer.
+    Only initialised when the model file is present — silently skipped otherwise."""
+    _enhancer = None
+    _unavailable = False
+    _lock = threading.Lock()
+
+    @classmethod
+    def get_enhancer(cls):
+        if cls._unavailable:
+            return None
+        if cls._enhancer is not None:
+            return cls._enhancer
+        with cls._lock:
+            if cls._enhancer is not None or cls._unavailable:
+                return cls._enhancer
+            if not GFPGAN_MODEL_PATH.exists():
+                print("GFPGANv1.4.pth not found — face enhancement disabled.")
+                cls._unavailable = True
+                return None
+            try:
+                from gfpgan import GFPGANer
+                print("Loading GFPGAN face restoration model…")
+                cls._enhancer = GFPGANer(
+                    model_path=str(GFPGAN_MODEL_PATH),
+                    upscale=1,          # we apply it after ESRGAN so don't scale again
+                    arch="clean",
+                    channel_multiplier=2,
+                    bg_upsampler=None,  # background already handled by ESRGAN
+                )
+                print("GFPGAN model loaded.")
+            except Exception as e:
+                print(f"GFPGAN failed to load ({e}) — face enhancement disabled.")
+                cls._unavailable = True
+            return cls._enhancer
+
+
+def _gfpgan_enhance_faces(pil_img) -> "PIL.Image.Image":
+    """Run GFPGAN face restoration on a PIL image. Returns enhanced PIL image,
+    or the original image unchanged if no faces are detected or GFPGAN is unavailable."""
+    import numpy as np
+    from PIL import Image
+    enhancer = GFPGANState.get_enhancer()
+    if enhancer is None:
+        return pil_img
+    try:
+        img_bgr = np.array(pil_img)[:, :, ::-1]  # RGB → BGR for OpenCV/GFPGAN
+        _, _, restored_img = enhancer.enhance(
+            img_bgr,
+            has_aligned=False,
+            only_center_face=False,
+            paste_back=True,
+        )
+        if restored_img is None:
+            return pil_img
+        return Image.fromarray(restored_img[:, :, ::-1])  # BGR → RGB
+    except Exception as e:
+        print(f"GFPGAN face enhancement failed ({e}) — using ESRGAN output.")
+        return pil_img
 
 
 def _lanczos_upscale(pil_img, target_scale: int = 2):
@@ -703,10 +784,10 @@ def _esrgan_upscale(img_np):
     return (out_np * 255).astype(np.uint8)
 
 
-# Images narrower or taller than this threshold are considered "tiny" and sent
-# through Real-ESRGAN (which adds detail). Larger images use Lanczos (which
-# preserves existing quality without hallucinating).
-ESRGAN_SIZE_THRESHOLD = 100
+# Images with either dimension below this threshold go through Real-ESRGAN (AI
+# detail reconstruction). Larger images use Lanczos for speed. Raised to 400 so
+# typical PDF portrait photos (200–400px) get ESRGAN rather than blurry Lanczos.
+ESRGAN_SIZE_THRESHOLD = 400
 
 
 def _extract_json(text: str) -> dict:
@@ -781,32 +862,64 @@ def analyze_text_semantic(text: str, is_digest: bool = False, language: str = "e
     if llm is None:
         raise Exception("LLM model not available yet.")
 
+    # Shared preamble — applied to both prompt variants
+    NOISE_EXCLUSION = (
+        "Never include page numbers, running headers, footers, publication dates, "
+        "captions, image labels, or any repeating metadata in any field.\n"
+    )
+    AUDIENCE = (
+        "You are narrating an educational presentation for curious students aged 14–18. "
+        "Use clear, engaging language — avoid jargon unless you briefly explain it.\n"
+    )
+
     if is_digest:
         system_instructions = (
-            "You are a news digest summarizer. The user will give you the full text of a magazine "
-            "or newspaper page that contains MULTIPLE separate articles or news items.\n"
-            "Identify every distinct article on the page and output a JSON object with:\n"
-            "- \"title\": The section heading of the whole page (e.g. 'Science Updates').\n"
-            "- \"subtitle\": A short description like '6 stories this issue'.\n"
-            "- \"summary\": One sentence summarising the page as a whole.\n"
+            f"{AUDIENCE}"
+            "The user will give you the full text of a magazine or newspaper page that contains "
+            "MULTIPLE separate articles or news items.\n"
+            "Identify every distinct article on the page and output a JSON object with exactly these fields:\n"
+            "- \"title\": The section heading of the whole page (e.g. 'Science Updates') — under 8 words.\n"
+            "- \"subtitle\": A short description like '5 stories this issue' — under 12 words.\n"
+            "- \"summary\": One sentence summarising the page as a whole (20–30 words).\n"
             "- \"topics\": A JSON array where each element has:\n"
-            "    - \"title\": The article headline (under 10 words).\n"
-            "    - \"summary\": One clear sentence (15-30 words) summarising that article.\n"
-            "- \"narration\": A natural narration (100-160 words) that introduces all the articles "
-            "briefly, one by one, in the order they appear.\n"
-            "Ensure the output is ONLY a valid JSON object."
+            "    - \"title\": The article headline — under 10 words.\n"
+            "    - \"summary\": One vivid sentence (20–35 words) summarising that article.\n"
+            "- \"narration\": A flowing narration (60–80 words) that briefly introduces each article "
+            "one by one in order, with natural transitions between them.\n"
+            f"{NOISE_EXCLUSION}"
+            "Output ONLY the raw JSON object — no markdown fences, no explanation.\n\n"
+            "Example output format:\n"
+            "{\"title\": \"Science Updates\", \"subtitle\": \"4 stories this issue\", "
+            "\"summary\": \"This page covers breakthroughs in space, medicine, climate, and AI.\", "
+            "\"topics\": [{\"title\": \"Mars Mission Milestone\", \"summary\": \"NASA's Perseverance rover collected its 20th rock sample, a major step toward returning Martian material to Earth.\"}], "
+            "\"narration\": \"Welcome to Science Updates. This week we have four fascinating stories ...\"}"
         )
     else:
         system_instructions = (
-            "You are a professional slide deck generator. Convert the user's text into a beautiful slide JSON object.\n"
-            "The JSON object must contain exactly these fields:\n"
-            "- \"title\": A concise title of the main topic (under 8 words).\n"
-            "- \"subtitle\": A brief subheading (under 12 words).\n"
-            "- \"summary\": A clear, 2-sentence explanation of the core concept. Exclude footers, headers, page numbers, and repeating metadata.\n"
-            "- \"highlights\": An array of exactly 3 bullet points of key takeaways (10-25 words each).\n"
-            "- \"supportingPoints\": An array of exactly 4 detailed notes or supporting facts.\n"
-            "- \"narration\": A natural, professional narration script summarizing this slide for audio playback (50-80 words).\n"
-            "Ensure the output is ONLY a valid JSON object."
+            f"{AUDIENCE}"
+            "Convert the user's text into a slide JSON object with exactly these fields:\n"
+            "- \"title\": The main topic — concise, under 8 words.\n"
+            "- \"subtitle\": A compelling subheading — under 12 words.\n"
+            "- \"summary\": Two clear sentences (30–50 words total) explaining the core concept.\n"
+            "- \"highlights\": An array of exactly 3 bullet points — key takeaways, 12–25 words each, "
+            "starting with a strong action verb or number.\n"
+            "- \"supportingPoints\": An array of exactly 4 interesting supporting facts or details "
+            "(15–30 words each) that deepen understanding.\n"
+            "- \"narration\": An engaging narration script (50–70 words) for audio playback — "
+            "written in present tense, conversational but informative, as if speaking directly to students.\n"
+            f"{NOISE_EXCLUSION}"
+            "Output ONLY the raw JSON object — no markdown fences, no explanation.\n\n"
+            "Example output format:\n"
+            "{\"title\": \"How Black Holes Form\", \"subtitle\": \"Stars that collapse under their own gravity\", "
+            "\"summary\": \"Black holes are regions in space where gravity is so strong that nothing, not even light, can escape. They form when massive stars exhaust their fuel and collapse.\", "
+            "\"highlights\": [\"Stars 20× the Sun's mass can become black holes after a supernova explosion.\", "
+            "\"The event horizon is the point of no return around a black hole.\", "
+            "\"Supermassive black holes lurk at the centres of most large galaxies.\"], "
+            "\"supportingPoints\": [\"The nearest known black hole, Gaia BH1, is 1,560 light-years from Earth.\", "
+            "\"Time dilation near a black hole means clocks tick slower the closer you get.\", "
+            "\"Stephen Hawking proposed that black holes slowly lose energy through Hawking radiation.\", "
+            "\"The first image of a black hole was captured by the Event Horizon Telescope in 2019.\"], "
+            "\"narration\": \"Black holes are one of the universe's most extreme objects. When a star much larger than our Sun runs out of fuel, it can no longer hold itself up against gravity. It collapses inward, triggering a massive explosion called a supernova, and leaving behind a region so dense that nothing — not even light — can escape. We call this boundary the event horizon. Scientists believe supermassive black holes, millions of times heavier than the Sun, sit at the heart of nearly every large galaxy, including our own Milky Way.\"}"
         )
 
     messages = [
@@ -815,12 +928,12 @@ def analyze_text_semantic(text: str, is_digest: bool = False, language: str = "e
     ]
 
     with LLMState._lock:
-        max_tokens = 1024
+        max_tokens = 1500
         response = llm.create_chat_completion(
             messages=messages,
             max_tokens=max_tokens,
-            temperature=0.1,
-            repeat_penalty=1.15
+            temperature=0.3,
+            repeat_penalty=1.1
         )
         output_text = response["choices"][0]["message"]["content"].strip()
     
@@ -995,18 +1108,21 @@ async def text_to_speech_boundaries(req: TTSRequest):
         print(f"TTS boundary generation failed: {exc}")
         raise HTTPException(status_code=500, detail=str(exc))
 
-def extract_strings(obj, paths, current_path=[]):
+def extract_strings(obj, paths, current_path=[], skip_keys: set | None = None):
+    skip_keys = skip_keys or set()
     if isinstance(obj, str):
         paths.append((current_path, obj))
     elif isinstance(obj, list):
         for idx, item in enumerate(obj):
-            extract_strings(item, paths, current_path + [idx])
+            extract_strings(item, paths, current_path + [idx], skip_keys)
     elif isinstance(obj, dict):
         for key, value in obj.items():
+            if key in skip_keys:
+                continue
             if key in ["title", "subtitle", "summary", "narration", "body"]:
-                extract_strings(value, paths, current_path + [key])
+                extract_strings(value, paths, current_path + [key], skip_keys)
             elif key in ["highlights", "supportingPoints", "topics"]:
-                extract_strings(value, paths, current_path + [key])
+                extract_strings(value, paths, current_path + [key], skip_keys)
 
 def set_by_path(obj, path, value):
     current = obj
@@ -1132,6 +1248,42 @@ def translate_deck(req: TranslateDeckRequest):
         print(f"Deck translation failed: {exc}")
         raise HTTPException(status_code=500, detail=str(exc))
 
+class TranslateFieldsRequest(BaseModel):
+    deck: dict
+    fields: list[str] = ["highlights", "supportingPoints"]
+    language: str = "te-IN"
+
+@app.post("/translate_fields")
+async def translate_fields_endpoint(req: TranslateFieldsRequest):
+    """Translate secondary deck fields (highlights, supportingPoints) lazily after the slide renders.
+    Only the requested fields are extracted and translated; the rest of the deck is returned as-is."""
+    tgt_lang_code = INDICTRANS_LANG_MAP.get(req.language, "tel_Telu")
+    import copy
+    deck_copy = copy.deepcopy(req.deck)
+
+    # Extract only the requested fields
+    only_keys = set(req.fields)
+    string_paths: list[tuple[list, str]] = []
+    for key in req.fields:
+        if key in deck_copy:
+            extract_strings({key: deck_copy[key]}, string_paths, skip_keys=set())
+
+    if not string_paths:
+        return deck_copy
+
+    texts = [t for _, t in string_paths]
+    print(f"/translate_fields: translating {len(texts)} strings ({req.fields}) to {req.language}...")
+    try:
+        translated = await asyncio.to_thread(translate_strings_indictrans2, texts, tgt_lang_code)
+        for (path, _), trans_val in zip(string_paths, translated):
+            # path[0] is the field key — route back into deck_copy
+            set_by_path(deck_copy, path, trans_val)
+        print(f"/translate_fields: done")
+    except Exception as e:
+        print(f"/translate_fields: translation failed ({e}), returning untranslated fields")
+
+    return deck_copy
+
 @app.post("/analyze")
 def analyze_text(req: AnalyzeRequest):
     text = req.text.strip()
@@ -1157,8 +1309,11 @@ def analyze_text(req: AnalyzeRequest):
                 for topic in analysis.get("topics", []):
                     topic["title_en"] = topic.get("title", "")
 
+                # Translate only priority fields immediately so the slide renders fast.
+                # highlights and supportingPoints are translated lazily via /translate_fields.
+                SECONDARY_FIELDS = {"highlights", "supportingPoints"}
                 string_paths: list[tuple[list, str]] = []
-                extract_strings(analysis, string_paths)
+                extract_strings(analysis, string_paths, skip_keys=SECONDARY_FIELDS)
                 if string_paths:
                     texts_to_translate = [t for _, t in string_paths]
                     try:
@@ -1678,14 +1833,19 @@ async def upscale_image(request: Request):
 
     if use_esrgan:
         import numpy as np
-        # Cap input so ESRGAN stays fast on CPU
-        MAX_INPUT_PX = 512
+        # Cap input to keep ESRGAN fast on CPU. 400px → 1600px output is the expected
+        # portrait case; 600px cap handles larger inputs while staying under ~2s per tile.
+        MAX_INPUT_PX = 600
         if w > MAX_INPUT_PX or h > MAX_INPUT_PX:
             pil_img.thumbnail((MAX_INPUT_PX, MAX_INPUT_PX), Image.LANCZOS)
         img_np = np.array(pil_img)
         upscaled_np = await loop.run_in_executor(None, _esrgan_upscale, img_np)
         out_pil = Image.fromarray(upscaled_np)
         method = "esrgan"
+        # Apply GFPGAN face restoration on top of ESRGAN if the model is available
+        if GFPGANState.get_enhancer() is not None:
+            out_pil = await loop.run_in_executor(None, _gfpgan_enhance_faces, out_pil)
+            method = "esrgan+gfpgan"
     else:
         # Lanczos is fast enough to run inline; wrap in executor anyway for consistency
         out_pil = await loop.run_in_executor(None, _lanczos_upscale, pil_img, 2)
@@ -1699,6 +1859,7 @@ async def upscale_image(request: Request):
         out_pil.save(buf, format="PNG")
         mime = "image/png"
     out_b64 = base64.b64encode(buf.getvalue()).decode()
+    out_w, out_h = out_pil.width, out_pil.height
     print(f"/upscale_image: output {out_w}×{out_h} px [{method}], {len(out_b64)//1024} KB b64")
 
     return {"image": f"data:{mime};base64,{out_b64}", "method": method}
@@ -1731,7 +1892,20 @@ def start_model_download() -> None:
     t.daemon = True
     t.start()
 
+def _prewarm_nllb() -> None:
+    """Load the NLLB translation model into RAM at startup so the first /analyze
+    call in Telugu mode does not pay the model-load penalty (~120s)."""
+    try:
+        IndicTransState.get_model()
+        print("NLLB-200 pre-warm complete.")
+    except Exception as e:
+        print(f"NLLB-200 pre-warm failed (will load on first use): {e}")
+
 if __name__ == "__main__":
     import uvicorn
+    # Pre-warm NLLB in background so it's ready before the first Telugu request
+    t = threading.Thread(target=_prewarm_nllb, daemon=True)
+    t.start()
+    start_model_download()
     print("Starting FastAPI Uvicorn server on port 8765...")
     uvicorn.run("tts_server:app", host="127.0.0.1", port=8765, reload=False)
