@@ -29,6 +29,19 @@ except ImportError:
 
 import requests
 
+from analyze_prompts import build_analyze_messages, extract_analysis_json
+from kaggle_client import (
+    kaggle_analyze,
+    kaggle_page_layout,
+    kaggle_status,
+    kaggle_translate,
+    kaggle_upload_pdf,
+    kaggle_upscale_image,
+    resolve_provider,
+    should_use_kaggle,
+)
+from page_layout_service import PDFMetadataAnalyzer, extract_page_layout
+
 BASE_DIR = Path(__file__).resolve().parent
 VENDOR_DIR = BASE_DIR / "vendor"
 
@@ -434,62 +447,6 @@ async def generate_sarvam_audio_and_boundaries(text: str, language: str, voice: 
     SarvamMemoryCache.set(text, language, voice, rate, audio_bytes, word_boundaries)
     return audio_bytes, word_boundaries
 
-def reconstruct_line_text(spans) -> str:
-    line_text = ""
-    sorted_spans = sorted(spans, key=lambda s: s.get("origin", (0, 0))[0])
-    for s in sorted_spans:
-        text = s.get("text", "")
-        if not text:
-            continue
-        if not line_text:
-            line_text = text
-        else:
-            needs_space = not line_text.endswith('-') and not text.startswith(',') and not text.startswith('.')
-            line_text += " " + text if needs_space else text
-    return line_text.strip()
-
-class PDFMetadataAnalyzer:
-    def __init__(self, doc):
-        self.running_headers_footers = set()
-        self._analyze(doc)
-        
-    def _analyze(self, doc):
-        from collections import Counter
-        top_lines = []
-        bottom_lines = []
-        
-        for page in doc:
-            height = page.rect.height
-            d = page.get_text("dict")
-            for b in d.get("blocks", []):
-                if b.get("type") == 0:
-                    for l in b.get("lines", []):
-                        spans = l.get("spans", [])
-                        if not spans:
-                            continue
-                        line_text = reconstruct_line_text(spans)
-                        if not line_text:
-                            continue
-                        y = spans[0]["origin"][1]
-                        if y < height * 0.10:
-                            top_lines.append(line_text)
-                        elif y > height * 0.90:
-                            bottom_lines.append(line_text)
-                            
-        top_counts = Counter(top_lines)
-        bottom_counts = Counter(bottom_lines)
-        
-        total_pages = len(doc)
-        min_count = max(2, min(3, total_pages))
-        
-        for text, count in top_counts.items():
-            if count >= min_count:
-                self.running_headers_footers.add(text)
-                
-        for text, count in bottom_counts.items():
-            if count >= min_count:
-                self.running_headers_footers.add(text)
-
 active_doc = None
 active_analyzer = None
 active_doc_lock = threading.Lock()
@@ -790,161 +747,60 @@ def _esrgan_upscale(img_np):
 ESRGAN_SIZE_THRESHOLD = 400
 
 
-def _extract_json(text: str) -> dict:
-    text = text.strip()
-    
-    # Clean markdown
-    if text.startswith("```json"):
-        text = text[7:]
-    elif text.startswith("```"):
-        text = text[3:]
-    if text.endswith("```"):
-        text = text[:-3]
-    text = text.strip()
-    
-    # Extract outer braces
-    first_brace = text.find('{')
-    last_brace = text.rfind('}')
-    if first_brace == -1 or last_brace == -1 or last_brace < first_brace:
-        raise ValueError("No JSON object found in LLM response.")
-    json_str = text[first_brace:last_brace + 1]
-    
-    # Try direct parse
-    try:
-        return json.loads(json_str)
-    except json.JSONDecodeError:
-        pass
-        
-    # Attempt simple auto-fixes
-    print("Direct JSON parse failed. Attempting auto-fixes...")
-    
-    # Fix Qwen's trailing bracket bug: "narration": "..." \n ] \n }
-    fixed_str = re.sub(r'"\s*\]\s*\}', '"\n}', json_str)
-    fixed_str = re.sub(r'"\s*,\s*\]\s*\}', '"\n}', fixed_str)
-    
-    # Close open quotes and braces if cut off
-    open_braces = fixed_str.count('{')
-    close_braces = fixed_str.count('}')
-    if open_braces > close_braces:
-        if fixed_str.count('"') % 2 != 0:
-            fixed_str += '"'
-        fixed_str += '}' * (open_braces - close_braces)
-        
-    try:
-        return json.loads(fixed_str)
-    except Exception as e:
-        print(f"Auto-fix failed: {e}")
-        # Last resort fallback: extract key-values via regex
-        fallback_dict = {}
-        for key in ["title", "subtitle", "summary", "narration"]:
-            match = re.search(r'"' + key + r'"\s*:\s*"([^"]*)"', json_str)
-            if match:
-                fallback_dict[key] = match.group(1)
-        
-        for key in ["highlights", "supportingPoints"]:
-            array_match = re.search(r'"' + key + r'"\s*:\s*\[(.*?)\]', json_str, re.DOTALL)
-            if array_match:
-                items = re.findall(r'"([^"]*)"', array_match.group(1))
-                fallback_dict[key] = items
-                
-        if "title" in fallback_dict:
-            print("Extracted fields via regex fallback.")
-            if "highlights" not in fallback_dict:
-                fallback_dict["highlights"] = []
-            if "supportingPoints" not in fallback_dict:
-                fallback_dict["supportingPoints"] = []
-            return fallback_dict
-            
-        raise ValueError(f"Failed to parse or repair JSON response: {e}")
-
-def analyze_text_semantic(text: str, is_digest: bool = False, language: str = "en-US") -> dict:
+def analyze_text_semantic_local(text: str, is_digest: bool = False, language: str = "en-US") -> dict:
     llm = LLMState.get_llm()
     if llm is None:
         raise Exception("LLM model not available yet.")
 
-    # Shared preamble — applied to both prompt variants
-    NOISE_EXCLUSION = (
-        "Never include page numbers, running headers, footers, publication dates, "
-        "captions, image labels, or any repeating metadata in any field.\n"
-    )
-    AUDIENCE = (
-        "You are narrating an educational presentation for curious students aged 14–18. "
-        "Use clear, engaging language — avoid jargon unless you briefly explain it.\n"
-    )
-
-    if is_digest:
-        system_instructions = (
-            f"{AUDIENCE}"
-            "The user will give you the full text of a magazine or newspaper page that contains "
-            "MULTIPLE separate articles or news items.\n"
-            "Identify every distinct article on the page and output a JSON object with exactly these fields:\n"
-            "- \"title\": The section heading of the whole page (e.g. 'Science Updates') — under 8 words.\n"
-            "- \"subtitle\": A short description like '5 stories this issue' — under 12 words.\n"
-            "- \"summary\": One sentence summarising the page as a whole (20–30 words).\n"
-            "- \"topics\": A JSON array where each element has:\n"
-            "    - \"title\": The article headline — under 10 words.\n"
-            "    - \"summary\": One vivid sentence (20–35 words) summarising that article.\n"
-            "- \"narration\": A flowing narration (60–80 words) that briefly introduces each article "
-            "one by one in order, with natural transitions between them.\n"
-            f"{NOISE_EXCLUSION}"
-            "Output ONLY the raw JSON object — no markdown fences, no explanation.\n\n"
-            "Example output format:\n"
-            "{\"title\": \"Science Updates\", \"subtitle\": \"4 stories this issue\", "
-            "\"summary\": \"This page covers breakthroughs in space, medicine, climate, and AI.\", "
-            "\"topics\": [{\"title\": \"Mars Mission Milestone\", \"summary\": \"NASA's Perseverance rover collected its 20th rock sample, a major step toward returning Martian material to Earth.\"}], "
-            "\"narration\": \"Welcome to Science Updates. This week we have four fascinating stories ...\"}"
-        )
-    else:
-        system_instructions = (
-            f"{AUDIENCE}"
-            "Convert the user's text into a slide JSON object with exactly these fields:\n"
-            "- \"title\": The main topic — concise, under 8 words.\n"
-            "- \"subtitle\": A compelling subheading — under 12 words.\n"
-            "- \"summary\": Two clear sentences (30–50 words total) explaining the core concept.\n"
-            "- \"highlights\": An array of exactly 3 bullet points — key takeaways, 12–25 words each, "
-            "starting with a strong action verb or number.\n"
-            "- \"supportingPoints\": An array of exactly 4 interesting supporting facts or details "
-            "(15–30 words each) that deepen understanding.\n"
-            "- \"narration\": An engaging narration script (50–70 words) for audio playback — "
-            "written in present tense, conversational but informative, as if speaking directly to students.\n"
-            f"{NOISE_EXCLUSION}"
-            "Output ONLY the raw JSON object — no markdown fences, no explanation.\n\n"
-            "Example output format:\n"
-            "{\"title\": \"How Black Holes Form\", \"subtitle\": \"Stars that collapse under their own gravity\", "
-            "\"summary\": \"Black holes are regions in space where gravity is so strong that nothing, not even light, can escape. They form when massive stars exhaust their fuel and collapse.\", "
-            "\"highlights\": [\"Stars 20× the Sun's mass can become black holes after a supernova explosion.\", "
-            "\"The event horizon is the point of no return around a black hole.\", "
-            "\"Supermassive black holes lurk at the centres of most large galaxies.\"], "
-            "\"supportingPoints\": [\"The nearest known black hole, Gaia BH1, is 1,560 light-years from Earth.\", "
-            "\"Time dilation near a black hole means clocks tick slower the closer you get.\", "
-            "\"Stephen Hawking proposed that black holes slowly lose energy through Hawking radiation.\", "
-            "\"The first image of a black hole was captured by the Event Horizon Telescope in 2019.\"], "
-            "\"narration\": \"Black holes are one of the universe's most extreme objects. When a star much larger than our Sun runs out of fuel, it can no longer hold itself up against gravity. It collapses inward, triggering a massive explosion called a supernova, and leaving behind a region so dense that nothing — not even light — can escape. We call this boundary the event horizon. Scientists believe supermassive black holes, millions of times heavier than the Sun, sit at the heart of nearly every large galaxy, including our own Milky Way.\"}"
-        )
-
-    messages = [
-        {"role": "system", "content": system_instructions},
-        {"role": "user", "content": text}
-    ]
+    messages = build_analyze_messages(text, is_digest=is_digest)
 
     with LLMState._lock:
-        max_tokens = 1500
         response = llm.create_chat_completion(
             messages=messages,
-            max_tokens=max_tokens,
+            max_tokens=1500,
             temperature=0.3,
-            repeat_penalty=1.1
+            repeat_penalty=1.1,
         )
         output_text = response["choices"][0]["message"]["content"].strip()
-    
+
     try:
-        return _extract_json(output_text)
+        return extract_analysis_json(output_text)
     except Exception as e:
         print("--- LLM OUTPUT PARSE FAILURE ---")
         print(output_text)
         print(f"Error: {e}")
         print("--------------------------------")
-        raise Exception(f"Failed to parse JSON response from local LLM: {e}")
+        raise Exception(f"Failed to parse JSON response from local LLM: {e}") from e
+
+
+def run_semantic_analysis(text: str, is_digest: bool = False, language: str = "en-US") -> dict:
+    provider = resolve_provider("LLM_PROVIDER", "auto")
+
+    if should_use_kaggle(provider):
+        try:
+            print(f"Calling Kaggle GPU /analyze (is_digest={is_digest}) …")
+            return kaggle_analyze(text, is_digest=is_digest)
+        except Exception as kaggle_err:
+            if provider == "kaggle":
+                raise
+            print(f"Kaggle analyze failed ({kaggle_err}); falling back to local LLM …")
+
+    return analyze_text_semantic_local(text, is_digest=is_digest, language=language)
+
+
+def translate_strings_for_deck(texts: list[str], target_lang: str) -> list[str]:
+    provider = resolve_provider("TRANSLATE_PROVIDER", "auto")
+
+    if should_use_kaggle(provider):
+        try:
+            print(f"Calling Kaggle GPU /translate ({len(texts)} strings) …")
+            return kaggle_translate(texts, target_lang=target_lang)
+        except Exception as kaggle_err:
+            if provider == "kaggle":
+                raise
+            print(f"Kaggle translate failed ({kaggle_err}); falling back to local NLLB …")
+
+    return translate_strings_indictrans2(texts, target_lang)
 
 # Request/Response Pydantic schemas
 class TTSRequest(BaseModel):
@@ -968,7 +824,18 @@ class TranscribeRequest(BaseModel):
 
 @app.get("/health")
 def health_check():
-    return {"ok": True, "service": "edge-tts"}
+    ks = kaggle_status()
+    return {
+        "ok": True,
+        "service": "veda-tts",
+        "providers": {
+            "llm": resolve_provider("LLM_PROVIDER", "local"),
+            "translate": resolve_provider("TRANSLATE_PROVIDER", "local"),
+            "layout": resolve_provider("LAYOUT_PROVIDER", "local"),
+            "upscale": resolve_provider("UPSCALE_PROVIDER", "local"),
+        },
+        "kaggle": ks,
+    }
 
 async def generate_audio_and_boundaries(text: str, voice: str, rate: str) -> tuple[bytes, list[dict]]:
     stream = edge_tts.Communicate(text=text, voice=voice, rate=rate, boundary="WordBoundary")
@@ -1186,12 +1053,12 @@ def translate_deck_fields(deck: dict) -> dict:
 
     texts_to_translate = [text for _, text in string_paths]
     try:
-        translated_texts = translate_strings_indictrans2(texts_to_translate, "tel_Telu")
-        print("translate_deck: IndicTrans2 succeeded.")
+        translated_texts = translate_strings_for_deck(texts_to_translate, "tel_Telu")
+        print("translate_deck: translation succeeded.")
     except Exception as it_err:
-        print(f"translate_deck: IndicTrans2 failed ({it_err}), falling back to Sarvam...")
+        print(f"translate_deck: translation failed ({it_err}), falling back to Sarvam...")
         if not SARVAM_API_KEY:
-            raise ValueError("IndicTrans2 unavailable and SARVAM_API_KEY is not set")
+            raise ValueError("Translation unavailable and SARVAM_API_KEY is not set") from it_err
         translated_texts = translate_strings_sarvam(texts_to_translate, SARVAM_API_KEY)
     for (path, _), trans_val in zip(string_paths, translated_texts):
         set_by_path(translated_deck, path, trans_val)
@@ -1215,20 +1082,17 @@ class TranslateRequest(BaseModel):
 
 @app.post("/translate")
 async def translate_endpoint(req: TranslateRequest):
-    """Translate a list of strings using IndicTrans2 (local model), falling back to Sarvam."""
+    """Translate strings via Kaggle GPU when enabled, else local NLLB with Sarvam fallback."""
     if not req.texts:
         return {"translations": []}
     try:
-        result = await asyncio.to_thread(
-            translate_strings_indictrans2,
-            req.texts,
-            req.target_lang
-        )
-        return {"translations": result, "engine": "indictrans2"}
+        result = await asyncio.to_thread(translate_strings_for_deck, req.texts, req.target_lang)
+        engine = "kaggle" if should_use_kaggle(resolve_provider("TRANSLATE_PROVIDER", "local")) else "nllb"
+        return {"translations": result, "engine": engine}
     except Exception as e:
-        print(f"IndicTrans2 translation failed: {e}. Falling back to Sarvam...")
+        print(f"Translation failed: {e}. Falling back to Sarvam...")
         if not SARVAM_API_KEY:
-            raise HTTPException(status_code=500, detail=f"IndicTrans2 failed and SARVAM_API_KEY not set: {e}")
+            raise HTTPException(status_code=500, detail=f"Translation failed and SARVAM_API_KEY not set: {e}")
         try:
             result = await asyncio.to_thread(translate_strings_sarvam, req.texts, SARVAM_API_KEY)
             return {"translations": result, "engine": "sarvam_fallback"}
@@ -1237,10 +1101,8 @@ async def translate_endpoint(req: TranslateRequest):
 
 @app.post("/translate_deck")
 def translate_deck(req: TranslateDeckRequest):
-    if not SARVAM_API_KEY:
-        raise HTTPException(status_code=400, detail="SARVAM_API_KEY is not set")
     try:
-        print("Translating deck fields into Telugu via Sarvam Translation API...")
+        print("Translating deck fields into Telugu...")
         return translate_deck_fields(req.deck)
     except SarvamCreditsExhaustedError:
         raise sarvam_credits_http_exception()
@@ -1274,7 +1136,7 @@ async def translate_fields_endpoint(req: TranslateFieldsRequest):
     texts = [t for _, t in string_paths]
     print(f"/translate_fields: translating {len(texts)} strings ({req.fields}) to {req.language}...")
     try:
-        translated = await asyncio.to_thread(translate_strings_indictrans2, texts, tgt_lang_code)
+        translated = await asyncio.to_thread(translate_strings_for_deck, texts, tgt_lang_code)
         for (path, _), trans_val in zip(string_paths, translated):
             # path[0] is the field key — route back into deck_copy
             set_by_path(deck_copy, path, trans_val)
@@ -1292,10 +1154,12 @@ def analyze_text(req: AnalyzeRequest):
 
     try:
         mode = "digest" if req.is_digest else "single-topic"
-        print(f"Starting local LLM analysis ({mode}, language: {req.language}) for {len(text)} chars...")
-        
+        llm_provider = resolve_provider("LLM_PROVIDER", "local")
+        backend = "kaggle" if should_use_kaggle(llm_provider) else "local"
+        print(f"Starting LLM analysis ({mode}, backend={backend}, language: {req.language}) for {len(text)} chars...")
+
         # We always generate the semantic structure in English first for high accuracy
-        analysis = analyze_text_semantic(text, is_digest=req.is_digest, language="en-US")
+        analysis = run_semantic_analysis(text, is_digest=req.is_digest, language="en-US")
         sarvam_credits_exhausted = False
         
         # If Telugu is selected, translate via IndicTrans2 (local) with Sarvam as fallback
@@ -1317,8 +1181,8 @@ def analyze_text(req: AnalyzeRequest):
                 if string_paths:
                     texts_to_translate = [t for _, t in string_paths]
                     try:
-                        translated = translate_strings_indictrans2(texts_to_translate, tgt_lang_code)
-                        print("IndicTrans2 translation succeeded.")
+                        translated = translate_strings_for_deck(texts_to_translate, tgt_lang_code)
+                        print("Translation succeeded.")
                     except Exception as it_err:
                         print(f"IndicTrans2 failed ({it_err}), falling back to Sarvam...")
                         if not SARVAM_API_KEY:
@@ -1347,10 +1211,10 @@ def analyze_text(req: AnalyzeRequest):
         if sarvam_credits_exhausted:
             analysis["sarvam_credits_exhausted"] = True
 
-        print("Local LLM analysis successful")
+        print("LLM analysis successful")
         return analysis
     except Exception as exc:
-        print(f"Local LLM analysis failed: {exc}")
+        print(f"LLM analysis failed: {exc}")
         raise HTTPException(status_code=500, detail=str(exc))
 
 @app.post("/upload_pdf")
@@ -1373,232 +1237,34 @@ async def upload_pdf(request: Request):
             active_doc = fitz.open(str(pdf_path))
             active_analyzer = PDFMetadataAnalyzer(active_doc)
             print(f"Loaded active PDF document: {pdf_path} ({len(pdf_bytes)} bytes, {len(active_doc)} pages)")
+            if should_use_kaggle(resolve_provider("LAYOUT_PROVIDER", "local")):
+                try:
+                    kaggle_upload_pdf(pdf_bytes)
+                    print("Mirrored PDF to Kaggle GPU server for layout extraction.")
+                except Exception as kaggle_err:
+                    layout_mode = resolve_provider("LAYOUT_PROVIDER", "local")
+                    if layout_mode == "kaggle":
+                        raise HTTPException(status_code=502, detail=f"Kaggle PDF upload failed: {kaggle_err}") from kaggle_err
+                    print(f"Kaggle PDF mirror failed ({kaggle_err}); using local layout extraction.")
             return {"ok": True, "num_pages": len(active_doc)}
         except Exception as e:
             print(f"Failed to load PDF document: {e}")
             raise HTTPException(status_code=500, detail=f"Failed to load PDF: {e}")
 
-def _extract_lines_pymupdf(page_obj, width, height, active_analyzer):
-    """
-    PyMuPDF-based text line extraction — used as fallback when pdfplumber is
-    unavailable or fails.  Applies the same header/footer/margin filters as the
-    pdfplumber path.
-    """
-    d = page_obj.get_text("dict")
-    lines = []
-    for b in d.get("blocks", []):
-        if b.get("type") != 0:
-            continue
-        for l in b.get("lines", []):
-            spans = l.get("spans", [])
-            if not spans:
-                continue
-            line_text = reconstruct_line_text(spans)
-            if not line_text:
-                continue
-            if active_analyzer and line_text in active_analyzer.running_headers_footers:
-                continue
-            origin_y = spans[0]["origin"][1]
-            is_margin = (origin_y < height * 0.10) or (origin_y > height * 0.90)
-            if is_margin:
-                if re.match(r'^\d+$', line_text) or re.match(r'^[ivxIVX]+$', line_text):
-                    continue
-                if re.match(r'^(page|slide|p\.)\s*\d+$', line_text, re.IGNORECASE):
-                    continue
-            max_font_size = 0.0
-            min_x = float("inf")
-            baseline_y = 0.0
-            for s in spans:
-                max_font_size = max(max_font_size, s["size"])
-                min_x = min(min_x, s["origin"][0])
-                baseline_y = max(baseline_y, height - s["origin"][1])
-            lines.append({
-                "text": line_text,
-                "x": min_x,
-                "y": baseline_y,
-                "fontSize": max_font_size,
-            })
-    return lines
-
-
-def _group_words_into_lines(words):
-    """Group pdfplumber word dicts into lines by proximity of their `top` coordinate."""
-    if not words:
-        return []
-    sorted_w = sorted(words, key=lambda w: (w["top"], w["x0"]))
-    lines, cur = [], [sorted_w[0]]
-    cur_top = sorted_w[0]["top"]
-    for w in sorted_w[1:]:
-        if abs(w["top"] - cur_top) <= 4:
-            cur.append(w)
-        else:
-            lines.append(sorted(cur, key=lambda w: w["x0"]))
-            cur, cur_top = [w], w["top"]
-    lines.append(sorted(cur, key=lambda w: w["x0"]))
-    return lines
-
-
-def _extract_lines_pdfplumber(pdf_path, page_num, img_rects_topdown, width, height, active_analyzer):
-    """
-    Layout-aware text extraction combining pdfplumber (text) and pre-extracted image
-    rectangles (to filter text that bleeds over image zones).
-
-    img_rects_topdown: list of (x0, y0, x1, y1) in top-down screen coords.
-
-    Returns list of {"text", "x", "y" (bottom-up), "fontSize"} to match the
-    existing PyMuPDF output format expected by the frontend.
-
-    Column-detection approach:
-    - Sample horizontal coverage across the middle 40 % of the page.
-    - A gap ≥ 3 % of page width in that region signals a column gutter.
-    - Full-width spans (crossing the gutter) are treated as headers/titles and
-      placed before/after column content depending on their vertical position.
-    """
-    with _pdfplumber.open(pdf_path) as pdf:
-        pl_page = pdf.pages[page_num - 1]
-
-        # Words with per-word font size (falls back gracefully if attr missing)
-        try:
-            words = pl_page.extract_words(
-                extra_attrs=["size"],
-                keep_blank_chars=False,
-                x_tolerance=3,
-                y_tolerance=3,
-            )
-        except Exception:
-            words = pl_page.extract_words(keep_blank_chars=False, x_tolerance=3, y_tolerance=3)
-            for w in words:
-                w.setdefault("size", 12.0)
-
-        if not words:
-            return []
-
-        # Filter words that substantially overlap any image zone (> 30 % of word width)
-        def _overlaps_image(w):
-            wx0, wy0, wx1, wy1 = w["x0"], w["top"], w["x1"], w["bottom"]
-            for (ix0, iy0, ix1, iy1) in img_rects_topdown:
-                ox = min(wx1, ix1) - max(wx0, ix0)
-                oy = min(wy1, iy1) - max(wy0, iy0)
-                if ox > 0 and oy > 0:
-                    word_w = wx1 - wx0 or 1
-                    if ox / word_w > 0.3:
-                        return True
-            return False
-
-        filtered = [w for w in words if not _overlaps_image(w)]
-        if not filtered:
-            return []
-
-        # ── Column detection ─────────────────────────────────────────────────
-        mid_start = int(width * 0.30)
-        mid_end = int(width * 0.70)
-        x_spans = [(w["x0"], w["x1"]) for w in filtered]
-
-        # Count how many words cover each x position (sampled every 2 pts)
-        coverage = {x: sum(1 for (x0, x1) in x_spans if x0 <= x <= x1)
-                    for x in range(mid_start, mid_end, 2)}
-
-        # Find the widest contiguous zero-coverage gap in the middle band
-        gutter_x = None
-        max_gap = 0
-        gap_start = None
-        for x in range(mid_start, mid_end, 2):
-            if coverage.get(x, 0) == 0:
-                if gap_start is None:
-                    gap_start = x
-            else:
-                if gap_start is not None:
-                    gap = x - gap_start
-                    if gap > max_gap:
-                        max_gap, gutter_x = gap, (gap_start + x) // 2
-                    gap_start = None
-        if gap_start is not None:
-            gap = mid_end - gap_start
-            if gap > max_gap:
-                max_gap, gutter_x = gap, (gap_start + mid_end) // 2
-
-        is_two_col = max_gap >= width * 0.03 and gutter_x is not None
-
-        # ── Group into lines then classify ───────────────────────────────────
-        all_line_groups = _group_words_into_lines(filtered)
-
-        if is_two_col:
-            # A line "spans the gutter" if it has words on both sides
-            def _spans(line):
-                return any(w["x0"] < gutter_x for w in line) and any(w["x1"] > gutter_x for w in line)
-
-            full_lines   = [l for l in all_line_groups if _spans(l)]
-            left_lines   = [l for l in all_line_groups if not _spans(l) and all(w["x1"] <= gutter_x for w in l)]
-            right_lines  = [l for l in all_line_groups if not _spans(l) and all(w["x0"] >= gutter_x for w in l)]
-
-            # Column content starts where the first left or right column word appears
-            col_words = [w for l in left_lines + right_lines for w in l]
-            col_start = min((w["top"] for w in col_words), default=0)
-            col_end   = max((w["top"] for w in col_words), default=height)
-
-            pre_col  = sorted([l for l in full_lines if l[0]["top"] < col_start],  key=lambda l: l[0]["top"])
-            post_col = sorted([l for l in full_lines if l[0]["top"] > col_end],   key=lambda l: l[0]["top"])
-            mid_full = sorted([l for l in full_lines if col_start <= l[0]["top"] <= col_end], key=lambda l: l[0]["top"])
-
-            # Primary column = the one with more words (main article body).
-            # Secondary column = the one with fewer words (sidebar / captions).
-            # If counts are within 1.8× of each other, use left-first (standard order).
-            left_wc  = sum(len(l) for l in left_lines)
-            right_wc = sum(len(l) for l in right_lines)
-            if right_wc > left_wc * 1.8:
-                primary_col   = sorted(right_lines, key=lambda l: l[0]["top"])
-                secondary_col = sorted(left_lines,  key=lambda l: l[0]["top"])
-            else:
-                primary_col   = sorted(left_lines,  key=lambda l: l[0]["top"])
-                secondary_col = sorted(right_lines, key=lambda l: l[0]["top"])
-
-            ordered = (
-                pre_col
-                + primary_col
-                + mid_full
-                + secondary_col
-                + post_col
-            )
-        else:
-            ordered = all_line_groups
-
-        # ── Build output, applying header/footer filters ─────────────────────
-        result = []
-        for line_words in ordered:
-            text = " ".join(w["text"] for w in line_words).strip()
-            if not text:
-                continue
-
-            if active_analyzer and text in active_analyzer.running_headers_footers:
-                continue
-
-            top_y = line_words[0]["top"]
-            is_margin = top_y < height * 0.10 or top_y > height * 0.90
-            if is_margin:
-                if re.match(r'^\d+$', text) or re.match(r'^[ivxIVX]+$', text):
-                    continue
-                if re.match(r'^(page|slide|p\.)\s*\d+$', text, re.IGNORECASE):
-                    continue
-
-            sizes = [w.get("size") or 12.0 for w in line_words]
-            font_size = max(sizes)
-            min_x = min(w["x0"] for w in line_words)
-            # Convert top-down bottom coord → bottom-up y (matches PyMuPDF output)
-            y_bottom_up = height - line_words[0]["bottom"]
-
-            result.append({
-                "text": text,
-                "x": min_x,
-                "y": y_bottom_up,
-                "fontSize": font_size,
-            })
-
-        return result
-
-
 @app.get("/page_layout")
 def get_page_layout(page: int):
     global active_doc, active_analyzer
+    layout_provider = resolve_provider("LAYOUT_PROVIDER", "local")
+
+    if should_use_kaggle(layout_provider):
+        try:
+            print(f"GET /page_layout?page={page} via Kaggle …")
+            return kaggle_page_layout(page)
+        except Exception as kaggle_err:
+            if layout_provider == "kaggle":
+                raise HTTPException(status_code=502, detail=str(kaggle_err)) from kaggle_err
+            print(f"Kaggle layout failed ({kaggle_err}); using local extraction …")
+
     if active_doc is None:
         pdf_path = BASE_DIR / "active_doc.pdf"
         if pdf_path.exists():
@@ -1609,103 +1275,20 @@ def get_page_layout(page: int):
                 raise HTTPException(status_code=500, detail=f"Failed to open saved PDF: {e}")
         else:
             raise HTTPException(status_code=400, detail="No active PDF document uploaded")
-            
+
     if active_analyzer is None and active_doc is not None:
         active_analyzer = PDFMetadataAnalyzer(active_doc)
-    
+
     if page < 1 or page > len(active_doc):
         raise HTTPException(status_code=400, detail=f"Invalid page number {page}")
-    
+
     with active_doc_lock:
         try:
-            page_obj = active_doc[page - 1]
-            rect = page_obj.rect
-            width = rect.width
-            height = rect.height
-            
-            lines = []
-            images = []
-
-            # ── Image extraction via get_images() ────────────────────────────────
-            # get_text("dict") type-1 blocks miss most PDF images because the
-            # majority of PDFs embed images as XObjects (placed with Do operator)
-            # rather than inline. get_images(full=True) finds all of them.
-            seen_xrefs = set()
-            for img_info in page_obj.get_images(full=True):
-                xref = img_info[0]
-                if xref in seen_xrefs:
-                    continue
-                seen_xrefs.add(xref)
-
-                try:
-                    rects = page_obj.get_image_rects(xref)
-                except Exception:
-                    rects = []
-
-                for rect in rects:
-                    img_w = rect.width
-                    img_h = rect.height
-                    # Skip invisible or near-zero rendered size
-                    if img_w < 5 or img_h < 5:
-                        continue
-                    # Skip tiny decorative elements (icons, bullets, dividers)
-                    if img_w < 50 or img_h < 50:
-                        continue
-                    # Skip full-page-width backgrounds / decorative banners
-                    if img_w > width * 0.90:
-                        continue
-
-                    try:
-                        img_dict = active_doc.extract_image(xref)
-                    except Exception:
-                        continue
-
-                    image_bytes = img_dict.get("image")
-                    if not image_bytes:
-                        continue
-                    ext = img_dict.get("ext", "png")
-                    img_base64 = base64.b64encode(image_bytes).decode("utf-8")
-                    url = f"data:image/{ext};base64,{img_base64}"
-                    images.append({
-                        "url": url,
-                        "x": rect.x0,
-                        "y": height - rect.y1,
-                        "w": img_w,
-                        "h": img_h,
-                        "cx": (rect.x0 + rect.x1) / 2,
-                        "cy": height - (rect.y0 + rect.y1) / 2
-                    })
-                    break  # one rect per xref is enough for position info
-
-            # ── Text extraction ───────────────────────────────────────────────
-            # pdfplumber gives column-aware, image-zone-filtered text.
-            # Fall back to PyMuPDF's get_text("dict") if pdfplumber is unavailable
-            # or raises an unexpected error.
-            if _PDFPLUMBER_AVAILABLE:
-                try:
-                    # Convert image positions to top-down coords for overlap filtering
-                    img_rects_td = [
-                        (img["x"], height - img["y"] - img["h"],
-                         img["x"] + img["w"], height - img["y"])
-                        for img in images
-                    ]
-                    lines = _extract_lines_pdfplumber(
-                        str(active_doc.name), page, img_rects_td,
-                        width, height, active_analyzer
-                    )
-                    print(f"pdfplumber extracted {len(lines)} lines for page {page}")
-                except Exception as pl_err:
-                    print(f"pdfplumber failed for page {page} ({pl_err}), falling back to PyMuPDF")
-                    lines = _extract_lines_pymupdf(page_obj, width, height, active_analyzer)
-            else:
-                lines = _extract_lines_pymupdf(page_obj, width, height, active_analyzer)
-
-            return {
-                "width": width,
-                "height": height,
-                "lines": lines,
-                "images": images
-            }
+            result = extract_page_layout(
+                active_doc, active_analyzer, page, pdfplumber_available=_PDFPLUMBER_AVAILABLE
+            )
+            print(f"Local layout extracted {len(result.get('lines', []))} lines for page {page}")
+            return result
         except Exception as e:
             print(f"Failed to extract page layout for page {page}: {e}")
             raise HTTPException(status_code=500, detail=str(e))
@@ -1824,6 +1407,17 @@ async def upscale_image(request: Request):
     pil_img = Image.open(BytesIO(img_bytes)).convert("RGB")
 
     w, h = pil_img.width, pil_img.height
+    upscale_provider = resolve_provider("UPSCALE_PROVIDER", "local")
+
+    if should_use_kaggle(upscale_provider):
+        try:
+            print(f"/upscale_image: forwarding {w}×{h} px to Kaggle GPU …")
+            return kaggle_upscale_image(body.get("image", ""), fmt)
+        except Exception as kaggle_err:
+            if upscale_provider == "kaggle":
+                raise HTTPException(status_code=502, detail=str(kaggle_err)) from kaggle_err
+            print(f"Kaggle upscale failed ({kaggle_err}); using local upscaler …")
+
     is_tiny = w < ESRGAN_SIZE_THRESHOLD or h < ESRGAN_SIZE_THRESHOLD
     use_esrgan = is_tiny and ESRGAN_MODEL_PATH.exists()
 

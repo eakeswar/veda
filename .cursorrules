@@ -16,10 +16,19 @@ word-level timestamps. The mascot is Zoro — a cartoon elephant avatar
 ```
 veda/
   server/
-    tts_server.py         ← Main FastAPI backend (port 8765)
-    .env                  ← API keys (SARVAM_API_KEY, OPENAI_API_KEY)
-    vendor/               ← pip-installed packages (edge-tts, fastapi, torch, transformers, etc.)
-    models/               ← Local GGUF model files (Qwen2.5)
+    tts_server.py         ← Main FastAPI backend (port 8765) — laptop orchestrator
+    analyze_prompts.py    ← Shared LLM prompts + JSON extract (local + Kaggle)
+    kaggle_client.py      ← HTTP client for Kaggle GPU tunnel
+    page_layout_service.py← PDF page layout extraction (local + Kaggle)
+    kaggle/
+      veda_gpu_server.py  ← Run in Kaggle notebook (GPU T4 x2 + cloudflared tunnel)
+      veda_kaggle.ipynb   ← Kaggle notebook template
+      prepare_kaggle_dataset.bat ← Bundle models for Kaggle dataset upload
+      veda-models-bundle/ ← Qwen GGUF, ESRGAN, rrdb_net, analyze_prompts, page_layout_service
+    test_kaggle.py        ← Benchmark / health-check Kaggle from laptop
+    .env                  ← API keys + Kaggle + provider routing (see below)
+    vendor/               ← pip-installed packages
+    models/               ← Local GGUF (Qwen), RealESRGAN, optional GFPGAN
     active_doc.pdf        ← Currently loaded PDF (written on upload)
 
   src/
@@ -42,69 +51,91 @@ veda/
 
 ## Backend — tts_server.py (FastAPI, port 8765)
 
+### Dual-mode architecture (laptop + Kaggle GPU)
+The laptop server always runs (port 8765). Heavy ML work routes to a **Kaggle GPU
+notebook** via cloudflared tunnel when `KAGGLE_ENABLED=true`. When Kaggle is off,
+unreachable, or hours are spent, **everything falls back to local CPU** automatically.
+
+| Workload | Kaggle on (`*_PROVIDER=kaggle`) | Local fallback |
+|----------|----------------------------------|----------------|
+| PDF layout (`/page_layout`) | Kaggle CPU (pdfplumber + PyMuPDF) | `page_layout_service.py` |
+| Slide analysis (`/analyze`) | Qwen 3B on GPU (llama-cpp) | Local Qwen via `LLMState` |
+| Telugu translation | NLLB-600M on GPU | Local NLLB-1.3B |
+| Image upscale | Real-ESRGAN on GPU | Local CPU ESRGAN/Lanczos |
+| TTS / karaoke | Always laptop | Sarvam → edge-tts fallback |
+
+Kaggle server: `server/kaggle/veda_gpu_server.py` — endpoints `/health`, `/upload_pdf`,
+`/page_layout`, `/analyze`, `/translate`, `/upscale_image`. Tunnel URL changes each
+notebook session; update `KAGGLE_API_BASE_URL` in `.env`.
+
 ### API Endpoints
 | Method | Path | What it does |
 |--------|------|--------------|
-| GET | /health | Health check |
-| POST | /upload_pdf | Accepts raw PDF bytes, saves as active_doc.pdf, opens with PyMuPDF |
-| GET | /page_layout?page=N | Returns { width, height, lines[], images[] } for page N |
-| POST | /analyze | Runs local Qwen 3B LLM, returns slide JSON; translates to Telugu via NLLB-200 if language=te-IN |
-| POST | /translate | Translates a list of strings using NLLB-200 (local), falls back to Sarvam |
-| POST | /translate_deck | Translates a full slide deck to Telugu; NLLB-200 first, Sarvam fallback |
-| POST | /tts | Sarvam TTS → returns { audio (base64 WAV), word_boundaries[] } |
+| GET | /health | Health check + provider modes + Kaggle reachability |
+| POST | /upload_pdf | Saves active_doc.pdf; mirrors bytes to Kaggle when layout provider is Kaggle |
+| GET | /page_layout?page=N | Returns { width, height, lines[], images[] } — Kaggle or local |
+| POST | /analyze | Slide JSON via Kaggle Qwen or local Qwen; Telugu via Kaggle/local NLLB |
+| POST | /translate | String list translation — Kaggle or local NLLB, Sarvam fallback |
+| POST | /translate_deck | Full deck Telugu — uses `translate_strings_for_deck()` (Kaggle-aware) |
+| POST | /translate_fields | Lazy secondary-field translation — Kaggle-aware |
+| POST | /tts | Sarvam TTS → returns { audio, word_boundaries[] }; edge-tts fallback |
 | GET | /tts_stream | Streams audio (Sarvam or edge-tts fallback) |
 | POST | /tts_boundaries | Returns only word_boundaries (no audio) |
 | POST | /transcribe | OpenAI Whisper STT → returns { text, word_boundaries[] } |
+| POST | /upscale_image | Real-ESRGAN or Lanczos — Kaggle GPU or local CPU |
 
 ### Key Classes & Functions
 - `SarvamMemoryCache` — in-memory single-entry cache (text+lang+voice+rate as key)
-- `LLMState` — singleton for llama-cpp Qwen 3B model, lazy-loads on first /analyze call
-- `IndicTransState` — singleton for NLLB-200 translation model (facebook/nllb-200-distilled-600M),
-  lazy-loads on first translation call; model already cached locally (downloaded Jul 1 2026), loads instantly
-- `PDFMetadataAnalyzer` — detects repeating headers/footers across pages to filter them
+- `LLMState` — singleton for llama-cpp Qwen (local fallback only)
+- `IndicTransState` — singleton for NLLB-200-1.3B (local fallback translation)
+- `PDFMetadataAnalyzer` — in `page_layout_service.py`; header/footer detection
+- `extract_page_layout()` — in `page_layout_service.py`; shared by laptop + Kaggle
+- `build_analyze_messages()` / `extract_analysis_json()` — in `analyze_prompts.py`
+- `run_semantic_analysis()` — routes `/analyze` to Kaggle or `analyze_text_semantic_local()`
+- `translate_strings_for_deck()` — routes all translation to Kaggle or local NLLB
+- `kaggle_client` — `should_use_kaggle()`, `kaggle_analyze()`, `kaggle_translate()`,
+  `kaggle_page_layout()`, `kaggle_upload_pdf()`, `kaggle_upscale_image()`
 - `detect_speech_boundaries(wav_bytes)` — finds lead-in/lead-out silence in WAV
-- `adjust_boundaries_to_silence(boundaries, wav_bytes)` — corrects STT timestamps for Sarvam's 150-570ms padding
-- `generate_fallback_boundaries(text, duration)` — proportional timestamp fallback if STT fails
-- `analyze_text_semantic(text, is_digest, language)` — calls Qwen LLM, parses JSON response with auto-repair
-- `translate_strings_indictrans2(texts, target_lang)` — translates using NLLB-200 locally (no API cost)
-- `translate_strings_sarvam(texts, api_key)` — batch translates via Sarvam Translate API (fallback only)
+- `adjust_boundaries_to_silence(boundaries, wav_bytes)` — corrects STT timestamps
+- `generate_fallback_boundaries(text, duration)` — proportional fallback if STT fails
+- `translate_strings_indictrans2()` — local NLLB only (fallback path)
+- `translate_strings_sarvam()` — Sarvam Translate API (last-resort fallback)
 
 ### LLM Config
-- Active model: Qwen2.5-3B-Instruct (GGUF, Q4_K_M quantization, ~2.1GB)
+- **Primary (when Kaggle on):** Qwen 2.5-3B-Instruct GGUF on Kaggle GPU via llama-cpp (`n_gpu_layers=-1`)
+- **Fallback (laptop):** Same model on CPU via `LLMState`
 - Model size controlled by env var `LOCAL_LLM_SIZE` (0.5B / 1.5B / 3B) — currently 3B
-- Loaded via llama-cpp-python with n_ctx=4096, n_threads=min(8, cpu_count)
-- Model paths checked: server/models/ only (no hardcoded user paths)
-- JSON auto-repair built in (_extract_json) because small models produce malformed JSON
-- Auto-downloads model from HuggingFace on first /analyze call if not present
+- Loaded via llama-cpp-python with n_ctx=4096, n_threads=min(8, cpu_count) on laptop
+- JSON auto-repair in `analyze_prompts.extract_analysis_json()` (small models produce malformed JSON)
+- Auto-downloads GGUF from HuggingFace on first local /analyze if not in server/models/
 
 ### Translation (NLLB-200)
-- Primary: NLLB-200 distilled 600M (facebook/nllb-200-distilled-600M) running locally on CPU
-- Why NLLB-200 instead of IndicTrans2: IndicTransToolkit requires MSVC C++ Build Tools to
-  compile its Cython extension — not available on this Windows server. NLLB-200 works with
-  plain transformers, no build tools needed.
+- **Kaggle:** facebook/nllb-200-distilled-600M on GPU (env `NLLB_MODEL` on Kaggle server)
+- **Laptop fallback:** facebook/nllb-200-1.3B on CPU via `IndicTransState`
 - Language code map (INDICTRANS_LANG_MAP): te-IN → tel_Telu, hi-IN → hin_Deva, etc.
-- Fallback: Sarvam Translate API if NLLB-200 fails or is not yet loaded
-- All translation calls go through translate_strings_indictrans2() first
+- All user-facing translation goes through `translate_strings_for_deck()` (Kaggle-first)
+- Sarvam Translate API is last-resort fallback only
 
 ### Text + Image Extraction (/page_layout)
-- **Text**: extracted by `_extract_lines_pdfplumber()` (pdfplumber + pdfminer.six in vendor/)
-  - Column-aware reading order: detects horizontal gutter (gap ≥ 3% of page width) → 2-column layout
-  - Primary column = the column with more words (goes first); secondary column (sidebar) goes last
-  - Image-zone filtering: words overlapping an image rect by > 30% of word width are dropped
-  - Header/footer filtering: same rules as PyMuPDF path (margin zone + running header set)
-  - Fallback: `_extract_lines_pymupdf()` (old get_text("dict") path) if pdfplumber fails
-- **Images**: extracted by PyMuPDF `page.get_images(full=True)` + `get_image_rects(xref)`
-  - Returns: url (base64), x, y (bottom-up), w, h, cx, cy (centre coordinates)
-  - Filters: skip w/h < 5 (artifacts), skip w/h < 50 (decorative icons), skip w > 90% page width (backgrounds)
-  - Deduplication by xref to avoid double-counting shared image resources
+- Logic lives in `page_layout_service.extract_page_layout()` — used by laptop and Kaggle
+- **Text**: pdfplumber with column detection + image-zone filtering; PyMuPDF fallback
+  - Column-aware reading order: gutter ≥ 3% page width → 2-column layout
+  - Primary column = more words first; secondary column (sidebar) last
+  - Image-zone filtering: words overlapping images by > 30% of word width dropped
+  - Header/footer filtering via `PDFMetadataAnalyzer`
+- **Images**: PyMuPDF `get_images(full=True)` + `get_image_rects(xref)`
+  - Filters: skip w/h < 5, skip w/h < 50 (icons), skip w > 90% page width (backgrounds)
+- When `LAYOUT_PROVIDER=kaggle`: PDF mirrored to Kaggle on upload; layout fetched from tunnel
 
 ### Known Issues / Things to Watch
 1. SarvamMemoryCache is single-entry only — second unique request evicts the first
 2. /transcribe uses OpenAI Whisper API (costs money) — Sarvam STT used for karaoke instead
 3. CORS is wide open (allow_origins=["*"]) — fine for demo, restrict before production
-4. NLLB-200 model (~2.3GB) — ALREADY DOWNLOADED to C:\Users\ads_eng5\.cache\huggingface\hub\models--facebook--nllb-200-distilled-600M\ on Jul 1 2026; loads from local cache instantly, no re-download needed
-5. Qwen 3B model (~2.1GB) downloads on first /analyze call if not in server/models/
-6. LLMState loads with n_gpu_layers not set — CPU only (no GPU on this server)
+4. Kaggle tunnel URL (`trycloudflare.com`) changes every notebook restart — update `.env`
+5. Kaggle GPU quota: 30 h/week; session must stay open while using Kaggle providers
+6. When `KAGGLE_ENABLED=false`, all providers fall back to laptop CPU automatically
+7. Laptop still loads local Qwen/NLLB on fallback paths — heavy RAM when Kaggle is off
+8. LLMState on laptop is CPU only (no GPU on Windows server)
 
 ---
 
@@ -128,11 +159,13 @@ veda/
 
 ### PDF Processing Flow
 1. User uploads PDF in LeftPanel
-2. Frontend sends raw bytes to POST /upload_pdf
-3. Frontend calls GET /page_layout?page=N for each page (returns lines + images with positions)
-4. For each page, frontend calls POST /analyze with extracted text
+2. Frontend sends raw bytes to POST /upload_pdf (mirrored to Kaggle if layout on Kaggle)
+3. Frontend calls GET /page_layout?page=N (Kaggle or local)
+4. For each page, frontend calls POST /analyze (Kaggle Qwen or local Qwen)
 5. LLM returns slide JSON → rendered as slide card in RightPanel
-6. On play: POST /tts → gets audio + word_boundaries → karaoke starts
+6. Telugu: translation via Kaggle/local NLLB (`/analyze`, `/translate_deck`, `/translate_fields`)
+7. On play: POST /tts → Sarvam audio + STT boundaries (edge-tts fallback)
+8. Images: POST /upscale_image (Kaggle ESRGAN or local) after layout loads
 
 ### Digest Pages
 - Pages with 3+ distinct articles are detected as "digest" pages
@@ -175,8 +208,23 @@ Sarvam TTS does NOT return word timestamps natively. Two-step pipeline:
 ```
 SARVAM_API_KEY=your_key_here
 OPENAI_API_KEY=your_key_here   # Optional, only for /transcribe endpoint
-LOCAL_LLM_SIZE=3B              # Options: 0.5B, 1.5B, 3B — currently 3B
+LOCAL_LLM_SIZE=3B              # Options: 0.5B, 1.5B, 3B — local fallback only
+
+# Kaggle GPU — set KAGGLE_ENABLED=true only while notebook session is running
+KAGGLE_ENABLED=false
+KAGGLE_API_BASE_URL=https://xxxx.trycloudflare.com
+KAGGLE_API_SECRET=veda-kaggle-dev
+KAGGLE_API_TIMEOUT=120
+
+# Provider routing: local | kaggle | auto
+# Default local on laptop; set to kaggle when Kaggle notebook is up
+LLM_PROVIDER=local
+TRANSLATE_PROVIDER=local
+LAYOUT_PROVIDER=local
+UPSCALE_PROVIDER=local
 ```
+When Kaggle hours are spent: set `KAGGLE_ENABLED=false` (or stop notebook) — all
+providers automatically use laptop fallback without code changes.
 
 ---
 
@@ -197,7 +245,15 @@ LOCAL_LLM_SIZE=3B              # Options: 0.5B, 1.5B, 3B — currently 3B
 ## Planned / Not Yet Built
 1. **Zoro avatar video** — HeyGen Talking Photo API (New_Zoro.png + Sarvam audio → talking video)
 2. **Video caching** — Cache by slide_id + language key, serve from /videos/{filename}
-3. **GPU inference** — n_gpu_layers=-1 for llama-cpp when GPU is available
+3. **Disk TTS/analyze cache** — Reduce repeat Sarvam and Kaggle calls
+
+## Kaggle GPU Offloading — DONE (Jul 4 2026)
+- `server/kaggle/veda_gpu_server.py` — FastAPI on Kaggle T4 x2 + cloudflared tunnel
+- Kaggle dataset bundle: Qwen GGUF, RealESRGAN, rrdb_net.py, analyze_prompts.py, page_layout_service.py
+- Laptop routes layout/analyze/translate/upscale to Kaggle when enabled; local fallback preserved
+- `server/test_kaggle.py --compare` benchmarks local vs Kaggle `/analyze`
+- pip package for Kaggle LLM: `llama-cpp-python` (NOT `llama_cpp`) with CUDA wheels
+- Keep Sarvam + HeyGen unchanged — TTS stays on laptop (Sarvam primary, edge-tts fallback)
 
 ## PDF Layout Improvements — DONE (Jul 3 2026)
 - pdfplumber replaces PyMuPDF get_text("dict") for text extraction in /page_layout
@@ -224,11 +280,12 @@ LOCAL_LLM_SIZE=3B              # Options: 0.5B, 1.5B, 3B — currently 3B
 ```
 OS: Windows Server 2019
 Path: C:\Users\ads_eng5\veda
-Backend: python server/tts_server.py (port 8765)
+Backend: python server/tts_server.py (port 8765) — laptop orchestrator
+Kaggle: server/kaggle/veda_gpu_server.py in notebook (GPU T4 x2, 30 h/week)
 Frontend: npm run dev (port 5173)
-Python: 3.11.9 at C:\Users\ads_eng5\AppData\Local\Programs\Python\Python311
+Python: 3.11.9
 Node: 20.19.0
-No GPU — all models run on CPU
+Laptop: no GPU — local fallback runs on CPU
 8 CPU cores, 64GB RAM
 ```
 
