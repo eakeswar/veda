@@ -5,7 +5,11 @@ mkdir "%DEST%" 2>nul
 
 copy /Y "%~dp0..\analyze_prompts.py" "%DEST%\"
 copy /Y "%~dp0..\page_layout_service.py" "%DEST%\"
+copy /Y "%~dp0..\upscale_service.py" "%DEST%\"
+copy /Y "%~dp0veda_gpu_server.py" "%DEST%\"
 copy /Y "%~dp0..\rrdb_net.py" "%DEST%\"
+mkdir "%DEST%\data" 2>nul
+copy /Y "%~dp0..\data\face_detection_yunet_2023mar.onnx" "%DEST%\data\"
 if exist "%~dp0..\models\RealESRGAN_x4plus.pth" (
   copy /Y "%~dp0..\models\RealESRGAN_x4plus.pth" "%DEST%\"
 ) else (

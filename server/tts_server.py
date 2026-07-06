@@ -23,7 +23,7 @@ from pathlib import Path
 try:
     from dotenv import load_dotenv
     # Load dotenv from BASE_DIR
-    load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
+    load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env", override=True)
 except ImportError:
     pass
 
@@ -41,6 +41,7 @@ from kaggle_client import (
     should_use_kaggle,
 )
 from page_layout_service import PDFMetadataAnalyzer, extract_page_layout
+from upscale_service import upscale_image as run_face_aware_upscale
 
 BASE_DIR = Path(__file__).resolve().parent
 VENDOR_DIR = BASE_DIR / "vendor"
@@ -566,7 +567,7 @@ def translate_strings_indictrans2(texts: list[str], target_lang: str = "tel_Telu
             **inputs,
             forced_bos_token_id=target_lang_id,
             num_beams=2,
-            max_length=dynamic_max_length,
+            max_new_tokens=dynamic_max_length,
             length_penalty=1.0,
             early_stopping=True,
         )
@@ -576,10 +577,6 @@ def translate_strings_indictrans2(texts: list[str], target_lang: str = "tel_Telu
     return result
 
 ESRGAN_MODEL_PATH = BASE_DIR / "models" / "RealESRGAN_x4plus.pth"
-ESRGAN_TILE_SIZE = 256   # Process this many pixels at a time; keeps RAM ~1GB on CPU
-ESRGAN_TILE_PAD  = 10    # Overlap between tiles to avoid edge seams
-
-GFPGAN_MODEL_PATH = BASE_DIR / "models" / "GFPGANv1.4.pth"
 
 class ESRGANState:
     """Lazy-load singleton for the Real-ESRGAN 4× upscaler."""
@@ -605,146 +602,6 @@ class ESRGANState:
             print("Real-ESRGAN model loaded.")
             cls._model = model
             return cls._model
-
-
-class GFPGANState:
-    """Lazy-load singleton for the GFPGAN face restoration enhancer.
-    Only initialised when the model file is present — silently skipped otherwise."""
-    _enhancer = None
-    _unavailable = False
-    _lock = threading.Lock()
-
-    @classmethod
-    def get_enhancer(cls):
-        if cls._unavailable:
-            return None
-        if cls._enhancer is not None:
-            return cls._enhancer
-        with cls._lock:
-            if cls._enhancer is not None or cls._unavailable:
-                return cls._enhancer
-            if not GFPGAN_MODEL_PATH.exists():
-                print("GFPGANv1.4.pth not found — face enhancement disabled.")
-                cls._unavailable = True
-                return None
-            try:
-                from gfpgan import GFPGANer
-                print("Loading GFPGAN face restoration model…")
-                cls._enhancer = GFPGANer(
-                    model_path=str(GFPGAN_MODEL_PATH),
-                    upscale=1,          # we apply it after ESRGAN so don't scale again
-                    arch="clean",
-                    channel_multiplier=2,
-                    bg_upsampler=None,  # background already handled by ESRGAN
-                )
-                print("GFPGAN model loaded.")
-            except Exception as e:
-                print(f"GFPGAN failed to load ({e}) — face enhancement disabled.")
-                cls._unavailable = True
-            return cls._enhancer
-
-
-def _gfpgan_enhance_faces(pil_img) -> "PIL.Image.Image":
-    """Run GFPGAN face restoration on a PIL image. Returns enhanced PIL image,
-    or the original image unchanged if no faces are detected or GFPGAN is unavailable."""
-    import numpy as np
-    from PIL import Image
-    enhancer = GFPGANState.get_enhancer()
-    if enhancer is None:
-        return pil_img
-    try:
-        img_bgr = np.array(pil_img)[:, :, ::-1]  # RGB → BGR for OpenCV/GFPGAN
-        _, _, restored_img = enhancer.enhance(
-            img_bgr,
-            has_aligned=False,
-            only_center_face=False,
-            paste_back=True,
-        )
-        if restored_img is None:
-            return pil_img
-        return Image.fromarray(restored_img[:, :, ::-1])  # BGR → RGB
-    except Exception as e:
-        print(f"GFPGAN face enhancement failed ({e}) — using ESRGAN output.")
-        return pil_img
-
-
-def _lanczos_upscale(pil_img, target_scale: int = 2):
-    """
-    Upscale a PIL image using Lanczos resampling + Unsharp Mask sharpening.
-
-    This is the primary upscaler for PDF-extracted images: it produces clean,
-    artefact-free results because PDF images are already at decent quality and
-    only need crisp interpolation, not AI-hallucinated detail.
-
-    Steps:
-      1. Lanczos ×target_scale for clean high-quality interpolation
-      2. Unsharp Mask to restore the slight softness Lanczos introduces
-    """
-    from PIL import Image, ImageFilter
-
-    new_w = pil_img.width * target_scale
-    new_h = pil_img.height * target_scale
-    upscaled = pil_img.resize((new_w, new_h), Image.LANCZOS)
-    # Mild unsharp mask: radius=1.5, percent=60, threshold=3
-    sharpened = upscaled.filter(ImageFilter.UnsharpMask(radius=1.5, percent=60, threshold=3))
-    return sharpened
-
-
-def _esrgan_upscale(img_np):
-    """
-    Run Real-ESRGAN 4× upscaling on a uint8 HWC RGB numpy array.
-    Reserved for genuinely tiny / highly degraded images.
-    Returns a uint8 HWC RGB numpy array.
-    """
-    import numpy as np
-    import torch
-
-    model = ESRGANState.get_model()
-
-    h, w = img_np.shape[:2]
-    img_t = torch.from_numpy(img_np.astype(np.float32) / 255.0).permute(2, 0, 1).unsqueeze(0)
-
-    tile = ESRGAN_TILE_SIZE
-    pad  = ESRGAN_TILE_PAD
-    scale = 4
-
-    out_h, out_w = h * scale, w * scale
-    output = torch.zeros(1, 3, out_h, out_w, dtype=torch.float32)
-
-    tiles_x = max(1, (w + tile - 1) // tile)
-    tiles_y = max(1, (h + tile - 1) // tile)
-
-    with torch.no_grad():
-        for iy in range(tiles_y):
-            for ix in range(tiles_x):
-                x0 = ix * tile
-                y0 = iy * tile
-                x1 = min(x0 + tile, w)
-                y1 = min(y0 + tile, h)
-
-                px0 = max(x0 - pad, 0)
-                py0 = max(y0 - pad, 0)
-                px1 = min(x1 + pad, w)
-                py1 = min(y1 + pad, h)
-
-                tile_in = img_t[:, :, py0:py1, px0:px1]
-                tile_out = model(tile_in)
-
-                ox0 = (x0 - px0) * scale
-                oy0 = (y0 - py0) * scale
-                ox1 = ox0 + (x1 - x0) * scale
-                oy1 = oy0 + (y1 - y0) * scale
-
-                output[:, :, y0 * scale:y1 * scale, x0 * scale:x1 * scale] = tile_out[:, :, oy0:oy1, ox0:ox1]
-
-    out_np = output.squeeze(0).permute(1, 2, 0).clamp(0, 1).numpy()
-    return (out_np * 255).astype(np.uint8)
-
-
-# Images with either dimension below this threshold go through Real-ESRGAN (AI
-# detail reconstruction). Larger images use Lanczos for speed. Raised to 400 so
-# typical PDF portrait photos (200–400px) get ESRGAN rather than blurry Lanczos.
-ESRGAN_SIZE_THRESHOLD = 400
 
 
 def analyze_text_semantic_local(text: str, is_digest: bool = False, language: str = "en-US") -> dict:
@@ -796,8 +653,6 @@ def translate_strings_for_deck(texts: list[str], target_lang: str) -> list[str]:
             print(f"Calling Kaggle GPU /translate ({len(texts)} strings) …")
             return kaggle_translate(texts, target_lang=target_lang)
         except Exception as kaggle_err:
-            if provider == "kaggle":
-                raise
             print(f"Kaggle translate failed ({kaggle_err}); falling back to local NLLB …")
 
     return translate_strings_indictrans2(texts, target_lang)
@@ -1374,21 +1229,16 @@ async def upscale_image(request: Request):
     """
     Upscale a base64-encoded image and return a sharper version.
 
-    Routing logic (based on input dimensions):
-      • width < ESRGAN_SIZE_THRESHOLD or height < ESRGAN_SIZE_THRESHOLD
-          → Real-ESRGAN ×4 (adds AI-reconstructed detail for tiny/degraded images)
-      • otherwise
-          → Lanczos ×2 + Unsharp Mask (clean, artefact-free for normal PDF images)
-
-    Real-ESRGAN is intentionally avoided for larger images because it hallucinates
-    detail that doesn't exist, causing the "morphed wax figure" distortion on people,
-    faces, and complex photo content.
+    Face-aware routing (see upscale_service.py):
+      • Faces detected → Lanczos (×4 if tiny, ×2 otherwise) — no AI on people
+      • No faces + tiny → Real-ESRGAN ×4 when model weights are present
+      • No faces + normal size → Lanczos ×2 + Unsharp Mask
 
     Request body (JSON):
         { "image": "<base64 PNG or JPEG>", "format": "png" | "jpeg" }
 
     Response (JSON):
-        { "image": "<base64 upscaled image>", "method": "lanczos" | "esrgan" }
+        { "image": "<base64 upscaled image>", "method": "lanczos_faces_x4" | "lanczos_x2" | "esrgan" }
     """
     try:
         from PIL import Image
@@ -1418,32 +1268,14 @@ async def upscale_image(request: Request):
                 raise HTTPException(status_code=502, detail=str(kaggle_err)) from kaggle_err
             print(f"Kaggle upscale failed ({kaggle_err}); using local upscaler …")
 
-    is_tiny = w < ESRGAN_SIZE_THRESHOLD or h < ESRGAN_SIZE_THRESHOLD
-    use_esrgan = is_tiny and ESRGAN_MODEL_PATH.exists()
-
-    print(f"/upscale_image: input {w}×{h} px, method={'esrgan' if use_esrgan else 'lanczos'}, fmt={fmt}")
+    esrgan_model = ESRGANState.get_model() if ESRGAN_MODEL_PATH.exists() else None
+    print(f"/upscale_image: input {w}×{h} px, esrgan={'yes' if esrgan_model else 'no'}, fmt={fmt}")
 
     loop = asyncio.get_event_loop()
-
-    if use_esrgan:
-        import numpy as np
-        # Cap input to keep ESRGAN fast on CPU. 400px → 1600px output is the expected
-        # portrait case; 600px cap handles larger inputs while staying under ~2s per tile.
-        MAX_INPUT_PX = 600
-        if w > MAX_INPUT_PX or h > MAX_INPUT_PX:
-            pil_img.thumbnail((MAX_INPUT_PX, MAX_INPUT_PX), Image.LANCZOS)
-        img_np = np.array(pil_img)
-        upscaled_np = await loop.run_in_executor(None, _esrgan_upscale, img_np)
-        out_pil = Image.fromarray(upscaled_np)
-        method = "esrgan"
-        # Apply GFPGAN face restoration on top of ESRGAN if the model is available
-        if GFPGANState.get_enhancer() is not None:
-            out_pil = await loop.run_in_executor(None, _gfpgan_enhance_faces, out_pil)
-            method = "esrgan+gfpgan"
-    else:
-        # Lanczos is fast enough to run inline; wrap in executor anyway for consistency
-        out_pil = await loop.run_in_executor(None, _lanczos_upscale, pil_img, 2)
-        method = "lanczos"
+    out_pil, method = await loop.run_in_executor(
+        None,
+        lambda: run_face_aware_upscale(pil_img, esrgan_model=esrgan_model),
+    )
 
     buf = BytesIO()
     if fmt == "jpeg":
