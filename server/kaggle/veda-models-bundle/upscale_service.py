@@ -1,9 +1,9 @@
-"""Face-aware image upscaling for Veda PDF slide images.
+"""Face- and person-aware image upscaling for Veda PDF slide images.
 
 Routing:
-  • Faces detected  → Lanczos (×4 if tiny, ×2 otherwise) — no AI hallucination on people
-  • No faces + tiny → Real-ESRGAN ×4 when a model is available
-  • No faces + normal size → Lanczos ×2 + Unsharp Mask
+  • Faces or full bodies detected → Lanczos (×4 if tiny, ×2 otherwise) — no AI hallucination on people
+  • No people + tiny            → Real-ESRGAN ×4 when a model is available
+  • No people + normal size     → Lanczos ×2 + Unsharp Mask
 """
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ ESRGAN_SIZE_THRESHOLD = int(os.environ.get("ESRGAN_SIZE_THRESHOLD", "400"))
 MAX_ESRGAN_INPUT_PX = 600
 ESRGAN_TILE_SIZE = 256
 ESRGAN_TILE_PAD = 10
+FACE_SCORE_THRESHOLD = float(os.environ.get("FACE_SCORE_THRESHOLD", "0.45"))
 
 FACE_MODEL_NAMES = (
     "face_detection_yunet_2026may.onnx",
@@ -28,6 +29,8 @@ FACE_MODEL_NAMES = (
 
 _detector = None
 _detector_unavailable = False
+_hog = None
+_hog_unavailable = False
 
 
 def _resolve_face_model_path() -> Path | None:
@@ -54,21 +57,43 @@ def _get_face_detector():
         return _detector
     model_path = _resolve_face_model_path()
     if model_path is None:
-        print("YuNet face model not found — treating tiny images as face-safe (Lanczos only).")
+        print("YuNet face model not found — treating tiny images as people-safe (Lanczos only).")
         _detector_unavailable = True
         return None
     try:
         import cv2
 
-        _detector = cv2.FaceDetectorYN.create(str(model_path), "", (320, 320), 0.55, 0.3, 5000)
+        _detector = cv2.FaceDetectorYN.create(
+            str(model_path), "", (320, 320), FACE_SCORE_THRESHOLD, 0.3, 5000,
+        )
     except Exception as exc:
         print(f"YuNet face detector load failed ({exc}) — using conservative Lanczos routing.")
         _detector_unavailable = True
     return _detector
 
 
-def image_has_faces(pil_img, score_threshold: float = 0.55) -> bool:
+def _get_hog_detector():
+    """OpenCV HOG person detector — catches full bodies YuNet misses on stylized/AI art."""
+    global _hog, _hog_unavailable
+    if _hog_unavailable:
+        return None
+    if _hog is not None:
+        return _hog
+    try:
+        import cv2
+
+        hog = cv2.HOGDescriptor()
+        hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+        _hog = hog
+    except Exception as exc:
+        print(f"HOG person detector load failed ({exc}) — face-only routing.")
+        _hog_unavailable = True
+    return _hog
+
+
+def image_has_faces(pil_img, score_threshold: float | None = None) -> bool:
     """Return True when YuNet detects at least one face."""
+    threshold = FACE_SCORE_THRESHOLD if score_threshold is None else score_threshold
     detector = _get_face_detector()
     if detector is None:
         return True
@@ -81,7 +106,46 @@ def image_has_faces(pil_img, score_threshold: float = 0.55) -> bool:
     _, faces = detector.detect(rgb)
     if faces is None or len(faces) == 0:
         return False
-    return bool((faces[:, 2] >= score_threshold).any())
+    return bool((faces[:, 2] >= threshold).any())
+
+
+def image_has_person_hog(pil_img) -> bool:
+    """Return True when OpenCV HOG detects at least one person-shaped region."""
+    hog = _get_hog_detector()
+    if hog is None:
+        return False
+
+    import cv2
+    import numpy as np
+
+    rgb = np.array(pil_img.convert("RGB"))
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    h, w = gray.shape
+    min_dim = min(h, w)
+    if min_dim < 128:
+        scale = 128 / min_dim
+        gray = cv2.resize(
+            gray,
+            (max(1, int(w * scale)), max(1, int(h * scale))),
+            interpolation=cv2.INTER_LINEAR,
+        )
+
+    rects, _weights = hog.detectMultiScale(
+        gray,
+        winStride=(8, 8),
+        padding=(8, 8),
+        scale=1.05,
+    )
+    return len(rects) > 0
+
+
+def detect_people(pil_img) -> tuple[bool, str | None]:
+    """Return (has_people, reason). reason is 'face', 'person', or None."""
+    if image_has_faces(pil_img):
+        return True, "face"
+    if image_has_person_hog(pil_img):
+        return True, "person"
+    return False, None
 
 
 def lanczos_upscale(pil_img, scale: int = 2):
@@ -143,10 +207,10 @@ def esrgan_upscale(img_np, model, device=None):
     return (out_np * 255).astype(np.uint8)
 
 
-def decide_upscale_method(width: int, height: int, has_faces: bool, esrgan_available: bool) -> tuple[str, int]:
+def decide_upscale_method(width: int, height: int, has_people: bool, esrgan_available: bool) -> tuple[str, int]:
     """Return (method, lanczos_scale). method is 'lanczos' or 'esrgan'."""
     is_tiny = width < ESRGAN_SIZE_THRESHOLD or height < ESRGAN_SIZE_THRESHOLD
-    if has_faces:
+    if has_people:
         return "lanczos", (4 if is_tiny else 2)
     if is_tiny and esrgan_available:
         return "esrgan", 4
@@ -157,7 +221,7 @@ def decide_upscale_method(width: int, height: int, has_faces: bool, esrgan_avail
 
 def upscale_image(pil_img, *, esrgan_model=None, device=None):
     """
-    Upscale a PIL RGB image using face-aware routing.
+    Upscale a PIL RGB image using face/person-aware routing.
 
     Returns (output_pil, method_name).
     """
@@ -165,9 +229,16 @@ def upscale_image(pil_img, *, esrgan_model=None, device=None):
     from PIL import Image
 
     w, h = pil_img.size
-    has_faces = image_has_faces(pil_img)
+    has_people, people_reason = detect_people(pil_img)
     esrgan_available = esrgan_model is not None
-    method, lanczos_scale = decide_upscale_method(w, h, has_faces, esrgan_available)
+    method, lanczos_scale = decide_upscale_method(w, h, has_people, esrgan_available)
+
+    if has_people:
+        print(f"Upscale {w}×{h}: people detected ({people_reason}) → Lanczos ×{lanczos_scale}")
+    elif method == "esrgan":
+        print(f"Upscale {w}×{h}: no people → Real-ESRGAN ×4")
+    else:
+        print(f"Upscale {w}×{h}: no people → Lanczos ×{lanczos_scale}")
 
     if method == "esrgan":
         work_img = pil_img
@@ -178,6 +249,6 @@ def upscale_image(pil_img, *, esrgan_model=None, device=None):
         return Image.fromarray(upscaled_np), "esrgan"
 
     out = lanczos_upscale(pil_img, lanczos_scale)
-    if has_faces:
-        return out, f"lanczos_faces_x{lanczos_scale}"
+    if has_people:
+        return out, f"lanczos_people_x{lanczos_scale}"
     return out, f"lanczos_x{lanczos_scale}"

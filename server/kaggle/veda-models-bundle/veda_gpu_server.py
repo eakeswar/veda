@@ -73,7 +73,31 @@ def _install_llama_cpp() -> None:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "llama-cpp-python"])
 
 
+def _fix_kaggle_pillow_stack() -> None:
+    """Align Pillow + torchvision on Kaggle (avoids _Ink and _imaging version skew).
+
+    Do NOT downgrade Pillow — pdfplumber 0.11+ requires Pillow>=12.2.
+    The original _Ink error is from an outdated torchvision against Pillow 12.
+    """
+    if not INPUT_ROOT.exists():
+        return
+    try:
+        print("Fixing Pillow/torchvision stack for NLLB (force-reinstall Pillow 12 + upgrade torchvision) …")
+        subprocess.check_call(
+            [
+                sys.executable, "-m", "pip", "install", "-q",
+                "--force-reinstall", "pillow>=12.2.0",
+            ],
+        )
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "-q", "-U", "torchvision"],
+        )
+    except Exception as exc:
+        print(f"Pillow/torchvision fix skipped ({exc})")
+
+
 def _ensure_packages() -> None:
+    _fix_kaggle_pillow_stack()
     for import_name, pip_args in _PIP_PACKAGES:
         try:
             __import__(import_name)
@@ -83,6 +107,26 @@ def _ensure_packages() -> None:
         __import__("llama_cpp")
     except ImportError:
         _install_llama_cpp()
+
+
+def _setup_upscale_service_path() -> None:
+    """Load upscale_service from working (manual upload) or copy from dataset."""
+    import shutil
+
+    dest = WORKING / "upscale_service.py"
+    if dest.is_file():
+        if str(WORKING) not in sys.path:
+            sys.path.insert(0, str(WORKING))
+        print(f"upscale_service: using {dest}")
+        return
+    for svc in INPUT_ROOT.rglob("upscale_service.py"):
+        shutil.copy2(svc, dest)
+        if str(WORKING) not in sys.path:
+            sys.path.insert(0, str(WORKING))
+        print(f"upscale_service: copied from {svc} → working")
+        return
+    if str(WORKING) not in sys.path:
+        sys.path.insert(0, str(WORKING))
 
 
 _ensure_packages()
@@ -110,11 +154,7 @@ else:
 
 from page_layout_service import PDFMetadataAnalyzer, extract_page_layout  # noqa: E402
 
-for svc in INPUT_ROOT.rglob("upscale_service.py"):
-    sys.path.insert(0, str(svc.parent))
-    break
-else:
-    sys.path.insert(0, str(WORKING))
+_setup_upscale_service_path()
 
 from upscale_service import upscale_image as run_face_aware_upscale  # noqa: E402
 
@@ -450,8 +490,8 @@ async def upscale_image(request: Request, _: None = Depends(verify_token)):
     except RuntimeError:
         pass
 
-    print(f"Kaggle /upscale_image: {w}×{h} px, esrgan={'yes' if esrgan_model else 'no'}")
     out, method = run_face_aware_upscale(img, esrgan_model=esrgan_model, device=device)
+    print(f"Kaggle /upscale_image: {w}×{h} px → {method}")
 
     buf = BytesIO()
     if fmt == "jpeg":

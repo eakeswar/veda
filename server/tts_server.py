@@ -1238,7 +1238,7 @@ async def upscale_image(request: Request):
         { "image": "<base64 PNG or JPEG>", "format": "png" | "jpeg" }
 
     Response (JSON):
-        { "image": "<base64 upscaled image>", "method": "lanczos_faces_x4" | "lanczos_x2" | "esrgan" }
+        { "image": "<base64 upscaled image>", "method": "lanczos_people_x4" | "lanczos_x2" | "esrgan" }
     """
     try:
         from PIL import Image
