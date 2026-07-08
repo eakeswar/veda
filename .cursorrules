@@ -4,10 +4,10 @@
 ## What This Project Is
 Veda converts any uploaded PDF into an interactive narrated presentation with
 karaoke-style word highlighting. The user uploads a PDF, the backend extracts
-layout per page, a local Qwen 3B LLM generates slide JSON (title, subtitle,
-summary, highlights, narration), and Sarvam AI handles TTS + STT for
-word-level timestamps. The mascot is Zoro — a cartoon elephant avatar
-(New_Zoro.png) to be animated via HeyGen Talking Photo API.
+layout per page, **Qwen 2.5 7B on Kaggle GPU** (or **3B on laptop CPU fallback**)
+generates slide JSON (title, subtitle, summary, highlights, narration), and
+Sarvam AI handles TTS + STT for word-level timestamps. The mascot is Zoro —
+a cartoon elephant avatar (New_Zoro.png) to be animated via HeyGen Talking Photo API.
 
 ---
 
@@ -17,26 +17,32 @@ word-level timestamps. The mascot is Zoro — a cartoon elephant avatar
 veda/
   server/
     tts_server.py         ← Main FastAPI backend (port 8765) — laptop orchestrator
+    security.py           ← Payload limits, PDF validation, CORS, Kaggle auth helpers
+    qwen_config.py        ← LOCAL_LLM_SIZE / KAGGLE_LLM_SIZE → GGUF filename + HF URL
     analyze_prompts.py    ← Shared LLM prompts + JSON extract (local + Kaggle)
     kaggle_client.py      ← HTTP client for Kaggle GPU tunnel
     page_layout_service.py← PDF page layout extraction (local + Kaggle)
-    upscale_service.py    ← Face-aware upscaling (YuNet + Lanczos/ESRGAN routing)
+    upscale_service.py    ← Lanczos-only upscaling (YuNet/HOG people-aware routing)
     data/
       face_detection_yunet_2023mar.onnx ← YuNet face detector (~230 KB, OpenCV 5)
     kaggle/
       veda_gpu_server.py  ← Run in Kaggle notebook (GPU T4 x2 + cloudflared tunnel)
-      veda_kaggle.ipynb   ← Kaggle notebook template (3 cells: check dataset, copy server, run)
-      prepare_kaggle_dataset.bat ← Bundle models for Kaggle dataset upload
-      veda-models-bundle/ ← Qwen GGUF, RealESRGAN, rrdb_net, analyze_prompts,
-                            page_layout_service, upscale_service, veda_gpu_server.py,
-                            data/face_detection_yunet_2023mar.onnx
+      veda_kaggle.ipynb   ← Kaggle notebook template (cells: copy bundle, run server)
+      prepare_kaggle_dataset.bat ← Build veda-models-bundle (7B + server scripts)
+      publish_kaggle_dataset.bat ← Publish to Kaggle API (project-models)
+      publish_project_models.py    ← Python publish script (uses KAGGLE_API_TOKEN)
+      download_qwen_7b.py          ← Download 7B GGUF into server/models/
+      veda-models-bundle/ ← Build output (gitignored): 7B GGUF, analyze_prompts,
+                            page_layout_service, qwen_config, security, veda_gpu_server.py
     test_kaggle.py        ← Benchmark / health-check Kaggle from laptop
     .env                  ← API keys + Kaggle + provider routing (see below)
     vendor/               ← pip-installed packages
-    models/               ← Local GGUF (Qwen), RealESRGAN
+    models/               ← Local GGUF (3B laptop fallback; 7B for Kaggle bundle publish)
     active_doc.pdf        ← Currently loaded PDF (written on upload)
 
   src/
+    config/
+      api.js              ← Centralized API base URLs + apiHeaders()
     App.jsx               ← Root React component
     main.jsx              ← Vite entry point
     index.css             ← Global styles, amber/gold design system, Tailwind v4
@@ -64,33 +70,41 @@ unreachable, or hours are spent, **everything falls back to local CPU** automati
 | Workload | Kaggle on (`*_PROVIDER=kaggle`) | Local fallback |
 |----------|----------------------------------|----------------|
 | PDF layout (`/page_layout`) | Kaggle CPU (pdfplumber + PyMuPDF) | `page_layout_service.py` |
-| Slide analysis (`/analyze`) | Qwen 3B on GPU (llama-cpp) | Local Qwen via `LLMState` |
+| Slide analysis (`/analyze`) | Qwen **7B** on GPU (llama-cpp) | Local Qwen **3B** via `LLMState` |
 | Telugu translation | NLLB-600M on GPU | Local NLLB-1.3B |
-| Image upscale | Face-aware: YuNet detect → Lanczos for faces, ESRGAN for non-faces (GPU) | Same logic on local CPU |
+| Image upscale | **Always laptop** (Lanczos only) | Same — `upscale_service.py` on CPU |
 | TTS / karaoke | Always laptop | Sarvam → edge-tts fallback |
 
 Kaggle server: `server/kaggle/veda_gpu_server.py` — endpoints `/health`, `/upload_pdf`,
-`/page_layout`, `/analyze`, `/translate`, `/upscale_image`. Tunnel URL changes each
-notebook session; update `KAGGLE_API_BASE_URL` in `.env` and **save the file** before
-restarting the backend. `load_dotenv(..., override=True)` so `.env` wins over stale shell env.
+`/page_layout`, `/analyze`, `/translate`. **No `/upscale_image` on Kaggle** (removed with ESRGAN).
+Tunnel URL changes each notebook session; update `KAGGLE_API_BASE_URL` in `.env` and **save the file**
+before restarting the backend. `load_dotenv(..., override=True)` so `.env` wins over stale shell env.
 
-**Kaggle GPU pinning (T4 x2):** Qwen LLM → GPU 0 (`main_gpu=0`); NLLB translation →
-`cuda:1` (env `NLLB_DEVICE`); Real-ESRGAN → `cuda:1`. NLLB pre-warms at server startup.
+**Kaggle GPU pinning (T4 x2):** Qwen 7B LLM → GPU 0 (`main_gpu=0`); NLLB translation → `cuda:1`
+(env `NLLB_DEVICE`). NLLB pre-warms at server startup.
+
+**Two different Kaggle credentials:**
+| Credential | Purpose |
+|------------|---------|
+| `KAGGLE_API_TOKEN` + `KAGGLE_USERNAME` | Official Kaggle API — publish `project-models` from laptop |
+| `KAGGLE_API_SECRET` | Custom tunnel password between laptop ↔ GPU notebook (required, no default) |
 
 **Kaggle notebook workflow:**
-1. Attach dataset `project-models` (latest version from `prepare_kaggle_dataset.bat`)
-2. Settings: GPU T4 x2, Internet ON
-3. Cell 1: verify dataset files; Cell 2: copy `veda_gpu_server.py` to `/kaggle/working/`
-4. Cell 3: `!python /kaggle/working/veda_gpu_server.py` — copy printed tunnel URL to `.env`
-5. Keep notebook running; stop session when done (GPU hours tick while open)
+1. Publish bundle: `server\kaggle\prepare_kaggle_dataset.bat` → `publish_kaggle_dataset.bat`
+2. Attach dataset `project-models` (latest version) — user slug e.g. `eakeswar/project-models`
+3. Settings: GPU T4 x2, Internet ON
+4. Cell 1: copy `veda_gpu_server.py`, `security.py`, `qwen_config.py`, `analyze_prompts.py`,
+   `page_layout_service.py` from dataset to `/kaggle/working/`
+5. Cell 2: set `KAGGLE_API_SECRET`, `VEDA_QUIET=1`, run server — copy tunnel URL to `.env`
+6. Keep notebook running; stop session when done (GPU hours tick while open)
 
 ### API Endpoints
 | Method | Path | What it does |
 |--------|------|--------------|
-| GET | /health | Health check + provider modes + Kaggle reachability |
+| GET | /health | Health check + provider modes + Kaggle reachability (tunnel URL redacted) |
 | POST | /upload_pdf | Saves active_doc.pdf; mirrors bytes to Kaggle when layout provider is Kaggle |
 | GET | /page_layout?page=N | Returns { width, height, lines[], images[] } — Kaggle or local |
-| POST | /analyze | Slide JSON via Kaggle Qwen or local Qwen; Telugu via Kaggle/local NLLB |
+| POST | /analyze | Slide JSON via Kaggle 7B or local 3B; accepts `page_layout` (plain/structured/qa) |
 | POST | /translate | String list translation — Kaggle or local NLLB, Sarvam fallback |
 | POST | /translate_deck | Full deck Telugu — uses `translate_strings_for_deck()` (Kaggle-aware) |
 | POST | /translate_fields | Lazy secondary-field translation — Kaggle-aware |
@@ -98,20 +112,22 @@ restarting the backend. `load_dotenv(..., override=True)` so `.env` wins over st
 | GET | /tts_stream | Streams audio (Sarvam or edge-tts fallback) |
 | POST | /tts_boundaries | Returns only word_boundaries (no audio) |
 | POST | /transcribe | OpenAI Whisper STT → returns { text, word_boundaries[] } |
-| POST | /upscale_image | Face-aware upscale — YuNet routing; Kaggle GPU or local CPU |
+| POST | /upscale_image | Lanczos-only upscale on laptop CPU (YuNet/HOG people-aware routing) |
 
 ### Key Classes & Functions
+- `security.py` — `validate_pdf_bytes()`, `require_kaggle_secret()`, `cors_origins()`, payload limits
+- `qwen_config.py` — `get_local_qwen_gguf_info()` (3B default), `get_kaggle_qwen_gguf_info()` (7B default)
 - `SarvamMemoryCache` — in-memory single-entry cache (text+lang+voice+rate as key)
 - `LLMState` — singleton for llama-cpp Qwen (local fallback only)
 - `IndicTransState` — singleton for NLLB-200-1.3B (local fallback translation)
 - `PDFMetadataAnalyzer` — in `page_layout_service.py`; header/footer detection
 - `extract_page_layout()` — in `page_layout_service.py`; shared by laptop + Kaggle
-- `upscale_image()` / `image_has_faces()` — in `upscale_service.py`; shared by laptop + Kaggle
+- `upscale_image()` — in `upscale_service.py`; Lanczos-only, laptop only
 - `build_analyze_messages()` / `extract_analysis_json()` — in `analyze_prompts.py`
 - `run_semantic_analysis()` — routes `/analyze` to Kaggle or `analyze_text_semantic_local()`
 - `translate_strings_for_deck()` — Kaggle-first; falls back to local NLLB if Kaggle fails
 - `kaggle_client` — `should_use_kaggle()`, `kaggle_analyze()`, `kaggle_translate()`,
-  `kaggle_page_layout()`, `kaggle_upload_pdf()`, `kaggle_upscale_image()`
+  `kaggle_page_layout()`, `kaggle_upload_pdf()`
 - `detect_speech_boundaries(wav_bytes)` — finds lead-in/lead-out silence in WAV
 - `adjust_boundaries_to_silence(boundaries, wav_bytes)` — corrects STT timestamps
 - `generate_fallback_boundaries(text, duration)` — proportional fallback if STT fails
@@ -119,12 +135,14 @@ restarting the backend. `load_dotenv(..., override=True)` so `.env` wins over st
 - `translate_strings_sarvam()` — Sarvam Translate API (last-resort fallback)
 
 ### LLM Config
-- **Primary (when Kaggle on):** Qwen 2.5-3B-Instruct GGUF on Kaggle GPU via llama-cpp (`n_gpu_layers=-1`)
-- **Fallback (laptop):** Same model on CPU via `LLMState`
-- Model size controlled by env var `LOCAL_LLM_SIZE` (0.5B / 1.5B / 3B) — currently 3B
+- **Primary (when Kaggle on):** Qwen 2.5-**7B**-Instruct GGUF (`qwen2.5-7b-instruct-q3_k_m.gguf`, ~3.8 GB)
+  on Kaggle GPU via llama-cpp (`n_gpu_layers=-1`). Controlled by `KAGGLE_LLM_SIZE=7B`.
+  Note: single-file **q3_k_m** used because q4_k_m 7B is split into 2 shards on HuggingFace.
+- **Fallback (laptop):** Qwen 2.5-**3B**-Instruct GGUF on CPU via `LLMState`. Controlled by `LOCAL_LLM_SIZE=3B`.
 - Loaded via llama-cpp-python with n_ctx=4096, n_threads=min(8, cpu_count) on laptop
 - JSON auto-repair in `analyze_prompts.extract_analysis_json()` (small models produce malformed JSON)
 - Auto-downloads GGUF from HuggingFace on first local /analyze if not in server/models/
+- Download 7B for bundle: `python server/kaggle/download_qwen_7b.py`
 
 ### Translation (NLLB-200)
 - **Kaggle (primary when notebook up):** facebook/nllb-200-distilled-600M on `cuda:1`
@@ -135,39 +153,51 @@ restarting the backend. `load_dotenv(..., override=True)` so `.env` wins over st
 - All user-facing translation goes through `translate_strings_for_deck()` (Kaggle-first)
 - Sarvam Translate API is last-resort fallback only (requires valid `SARVAM_API_KEY`)
 
-### Face-aware image upscaling (`upscale_service.py`)
-Real-ESRGAN hallucinates detail on faces ("wax figure" distortion). YuNet face detection
-(OpenCV 5 `FaceDetectorYN`, NOT Haar cascades) routes each image:
+### Image upscaling (`upscale_service.py`) — Lanczos only (Jul 8 2026)
+Real-ESRGAN removed (hallucinated faces; heavy GPU/RAM). All upscaling runs on **laptop CPU**.
+
+YuNet face + OpenCV HOG person detection routes each image:
 
 | Condition | Method | Response `method` field |
 |-----------|--------|-------------------------|
-| Face detected, tiny (< 400px either dim) | Lanczos ×4 + Unsharp Mask | `lanczos_faces_x4` |
-| Face detected, normal size | Lanczos ×2 + Unsharp Mask | `lanczos_faces_x2` |
-| No face, tiny | Real-ESRGAN ×4 (GPU on Kaggle, CPU tiles on laptop) | `esrgan` |
-| No face, normal size | Lanczos ×2 | `lanczos_x2` |
-| No face, tiny, no ESRGAN weights | Lanczos ×4 | `lanczos_x4` |
+| People detected, tiny (< 400px either dim) | Lanczos ×4 + Unsharp Mask | `lanczos_people_x4` |
+| People detected, normal size | Lanczos ×2 + Unsharp Mask | `lanczos_people_x2` |
+| No people, tiny | Lanczos ×4 + Unsharp Mask | `lanczos_x4` |
+| No people, normal size | Lanczos ×2 + Unsharp Mask | `lanczos_x2` |
 
 - Face model: `server/data/face_detection_yunet_2023mar.onnx` (~230 KB)
-- If YuNet model missing, conservatively treats images as face-present (Lanczos only)
-- Shared by `tts_server.py` and `kaggle/veda_gpu_server.py`
-- GFPGAN post-processing removed — face-aware routing makes it unnecessary
-- Kaggle installs `opencv-python-headless` at runtime for YuNet
+- If YuNet missing, conservatively uses Lanczos (no ESRGAN fallback)
+- `UPSCALE_PROVIDER=local` always — Kaggle does not run upscale
+- Legacy `RealESRGAN_x4plus.pth` / `rrdb_net.py` may remain in server/models/ but are unused
 
 ### Text + Image Extraction (/page_layout)
 - Logic lives in `page_layout_service.extract_page_layout()` — used by laptop and Kaggle
 - **Text**: pdfplumber with column detection + image-zone filtering; PyMuPDF fallback
   - Column-aware reading order: gutter ≥ 3% page width → 2-column layout
   - Primary column = more words first; secondary column (sidebar) last
-  - Image-zone filtering: words overlapping images by > 30% of word width dropped
+  - Image-zone filtering: words overlapping **inset** images by > 45% of word width dropped
+  - Background-like images (>85% page dim or >45% page area) excluded from overlap filter
   - Header/footer filtering via `PDFMetadataAnalyzer`
 - **Images**: PyMuPDF `get_images(full=True)` + `get_image_rects(xref)`
   - Filters: skip w/h < 5, skip w/h < 50 (icons), skip w > 90% page width (backgrounds)
 - When `LAYOUT_PROVIDER=kaggle`: PDF mirrored to Kaggle on upload; layout fetched from tunnel
 
+### Phase 1 magazine layout (Jul 8 2026) — frontend + LLM input
+Raw `/page_layout` lines are post-processed in `pdfUtils.js` before slide build and `/analyze`:
+- `mergeStackedHeadlineLines()` — merges multi-line magazine titles (e.g. "IS IT REALLY TRUE THAT …"
+  + "… stars are twinkling?")
+- `collapsePartialDuplicateLines()` — removes substring-duplicate title fragments
+- `buildStructuredAnalyzeText()` — tags lines `[HEADLINE]`, `[SUBHEAD]`, `[BODY]`, `[CALLOUT]`
+- `detectCalloutPage()` — Q&A / "Did you know?" magazine callout detection → `page_layout: "qa"`
+- Deck carries `analyzeText` + `pageLayout`; `fetchSemanticAnalysis()` sends these to `/analyze`
+- `analyze_prompts.build_analyze_messages()` understands structured/qa layouts (merge headlines,
+  use BODY for summary/highlights)
+- **Not yet built:** GPU vision parser (Docling/Marker) for hardest decorative layouts (Phase 2)
+
 ### Known Issues / Things to Watch
 1. SarvamMemoryCache is single-entry only — second unique request evicts the first
 2. /transcribe uses OpenAI Whisper API (costs money) — Sarvam STT used for karaoke instead
-3. CORS is wide open (allow_origins=["*"]) — fine for demo, restrict before production
+3. CORS restricted to localhost dev origins via `VEDA_CORS_ORIGINS` (not `*` in production path)
 4. Kaggle tunnel URL (`trycloudflare.com`) changes every notebook restart — update `.env`
    and **save file** (`Ctrl+S`) before restarting backend; stale shell env vars are overridden
 5. Kaggle GPU quota: 30 h/week; session must stay open while using Kaggle providers
@@ -176,7 +206,11 @@ Real-ESRGAN hallucinates detail on faces ("wax figure" distortion). YuNet face d
 8. LLMState on laptop is CPU only (no GPU on Windows server)
 9. `SARVAM_API_KEY` placeholder causes 403 — TTS falls back to edge-tts; translate falls
    back to local NLLB if Kaggle also fails
-10. Cloudflare 530 = Kaggle notebook stopped or tunnel dead — restart notebook, new URL
+10. Cloudflare 530 = Kaggle notebook stopped or tunnel dead — restart notebook, new URL;
+    set `KAGGLE_ENABLED=false` temporarily to use laptop-only while notebook is down
+11. `KAGGLE_API_SECRET` must be strong (≥16 chars) — default `veda-kaggle-dev` is rejected
+12. After republishing `project-models`, re-attach **latest version** in notebook and re-run cells
+13. Magazine callout pages (Discovery Q&A spreads) may still need Phase 2 GPU layout parser
 
 ---
 
@@ -202,11 +236,12 @@ Real-ESRGAN hallucinates detail on faces ("wax figure" distortion). YuNet face d
 1. User uploads PDF in LeftPanel
 2. Frontend sends raw bytes to POST /upload_pdf (mirrored to Kaggle if layout on Kaggle)
 3. Frontend calls GET /page_layout?page=N (Kaggle or local)
-4. For each page, frontend calls POST /analyze (Kaggle Qwen or local Qwen)
-5. LLM returns slide JSON → rendered as slide card in RightPanel
-6. Telugu: translation via Kaggle/local NLLB (`/analyze`, `/translate_deck`, `/translate_fields`)
-7. On play: POST /tts → Sarvam audio + STT boundaries (edge-tts fallback)
-8. Images: POST /upscale_image (face-aware; Kaggle GPU or local) after layout loads
+4. `extractPagePresentation()` post-processes lines (merge titles, structured analyze text)
+5. For each page, frontend calls POST /analyze with `analyzeText` + `page_layout` (Kaggle 7B or local 3B)
+6. LLM returns slide JSON → rendered as slide card in RightPanel
+7. Telugu: translation via Kaggle/local NLLB (`/analyze`, `/translate_deck`, `/translate_fields`)
+8. On play: POST /tts → Sarvam audio + STT boundaries (edge-tts fallback)
+9. Images: POST /upscale_image (Lanczos on laptop CPU) after layout loads
 
 ### Digest Pages
 - Pages with 3+ distinct articles are detected as "digest" pages
@@ -225,6 +260,7 @@ Real-ESRGAN hallucinates detail on faces ("wax figure" distortion). YuNet face d
 - Uses font-size gap clustering: finds the largest jump between consecutive unique font sizes
 - Threshold = midpoint of that gap — catches real headlines, skips pull quotes and captions
 - Fallback to `max(median * 1.35, maxFontSize * 0.50)` when no clear gap exists (< 2pt jump)
+- **Phase 1:** `mergeStackedHeadlineLines()` runs before `buildTitle()` for magazine multi-line titles
 
 ### mergeSemanticDeck (RightPanel.jsx)
 - Called when LLM analysis (background) completes to merge into the fast heuristic result
@@ -249,23 +285,31 @@ Sarvam TTS does NOT return word timestamps natively. Two-step pipeline:
 ```
 SARVAM_API_KEY=your_key_here
 OPENAI_API_KEY=your_key_here   # Optional, only for /transcribe endpoint
-LOCAL_LLM_SIZE=3B              # Options: 0.5B, 1.5B, 3B — local fallback only
+# VEDA_API_KEY=...             # Optional — require auth on laptop server
+# VEDA_CORS_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
 
-# Kaggle GPU — set KAGGLE_ENABLED=true only while notebook session is running
+LOCAL_LLM_SIZE=3B              # Laptop CPU fallback: 0.5B / 1.5B / 3B
+KAGGLE_LLM_SIZE=7B             # Kaggle GPU: 7B (q3_k_m in project-models bundle)
+
+# Kaggle GPU tunnel — set KAGGLE_ENABLED=true only while notebook session is running
 KAGGLE_ENABLED=false
 KAGGLE_API_BASE_URL=https://xxxx.trycloudflare.com
-KAGGLE_API_SECRET=veda-kaggle-dev
+KAGGLE_API_SECRET=             # Strong random secret (required; no veda-kaggle-dev)
 KAGGLE_API_TIMEOUT=120
 
 # Provider routing: local | kaggle | auto
-# Default local on laptop; set to kaggle when Kaggle notebook is up
 LLM_PROVIDER=local
 TRANSLATE_PROVIDER=local
 LAYOUT_PROVIDER=local
-UPSCALE_PROVIDER=local
+UPSCALE_PROVIDER=local         # Always local (Lanczos only)
+
+# Kaggle official API — publish project-models from laptop
+KAGGLE_USERNAME=your_username
+KAGGLE_API_TOKEN=KGAT_...      # kaggle.com/settings/api
+KAGGLE_DATASET_SLUG=project-models
 ```
-When Kaggle hours are spent: set `KAGGLE_ENABLED=false` (or stop notebook) — all
-providers automatically use laptop fallback without code changes.
+When Kaggle hours are spent or tunnel is dead: set `KAGGLE_ENABLED=false` (or stop notebook) —
+providers use laptop fallback without code changes.
 `tts_server.py` uses `load_dotenv(..., override=True)` so saved `.env` always wins
 over stale shell environment variables.
 
@@ -277,9 +321,9 @@ over stale shell environment variables.
 - pdfplumber, pdfminer.six — layout-aware text extraction (column detection, image-zone filtering)
   - cryptography + cffi installed system-wide (not in vendor) — required by pdfminer.six
 - llama-cpp-python — local LLM inference
-- torch (CPU build) — required for NLLB-200 translation and Real-ESRGAN upscaling
+- torch (CPU build) — required for NLLB-200 translation (local fallback)
 - transformers, sentencepiece, sacremoses — NLLB-200 model loading and tokenization
-- Pillow, opencv-python-headless, torchvision — image processing for /upscale_image
+- Pillow, opencv-python-headless — image processing for /upscale_image (Lanczos + YuNet/HOG)
 - requests, python-dotenv, httpx — HTTP and config
 - elevenlabs, openai — optional TTS/STT alternatives
 
@@ -289,40 +333,65 @@ over stale shell environment variables.
 1. **Zoro avatar video** — HeyGen Talking Photo API (New_Zoro.png + Sarvam audio → talking video)
 2. **Video caching** — Cache by slide_id + language key, serve from /videos/{filename}
 3. **Disk TTS/analyze cache** — Reduce repeat Sarvam and Kaggle calls
+4. **Phase 2 GPU layout parser** — Docling/Marker or vision model on Kaggle for decorative magazine pages
+
+## Security & Repo Cleanup — DONE (Jul 8 2026)
+- `server/security.py` — payload limits, PDF validation, CORS helpers, `require_kaggle_secret()`
+- Strong `KAGGLE_API_SECRET` required (rejects default `veda-kaggle-dev`)
+- Optional `VEDA_API_KEY` on laptop server; CORS restricted to localhost dev origins
+- `/health` redacts Kaggle tunnel URL; Kaggle `/health` requires auth
+- Centralized frontend API config: `src/config/api.js`
+- `veda-models-bundle/` treated as build output (gitignored except README)
+- Kaggle publish scripts: `prepare_kaggle_dataset.bat`, `publish_kaggle_dataset.bat`, `publish_project_models.py`
+
+## Model Split 3B / 7B — DONE (Jul 8 2026)
+- `server/qwen_config.py` — `LOCAL_LLM_SIZE=3B` (laptop), `KAGGLE_LLM_SIZE=7B` (GPU)
+- Kaggle bundle: `qwen2.5-7b-instruct-q3_k_m.gguf` (~3.8 GB single file; q4_k_m is split on HF)
+- Download helper: `server/kaggle/download_qwen_7b.py`
+- `prepare_kaggle_dataset.bat` wipes stale bundle, bundles 7B + server scripts only (no ESRGAN)
+
+## Real-ESRGAN Removed — DONE (Jul 8 2026)
+- `upscale_service.py` — Lanczos-only; YuNet + HOG people-aware routing
+- Removed from Kaggle bundle and GPU server; `/upscale_image` always laptop CPU
+- `UPSCALE_PROVIDER=local` always
+
+## Quiet Kaggle Startup — DONE (Jul 8 2026)
+- `VEDA_QUIET=1` default in `veda_gpu_server.py` — hides pip/HF progress, cloudflared spam
+- uvicorn log_level=warning; Pillow/torchvision fix only on NLLB failure
+
+## Phase 1 Magazine Layout — DONE (Jul 8 2026)
+- Stacked headline merge, partial dedupe, structured `[HEADLINE]`/`[BODY]` tags to LLM
+- Q&A callout page detection (`page_layout: qa`)
+- Relaxed image overlap filter (`_content_image_rects`, 45% threshold)
+- `analyze_prompts.py` structured/qa prompt branches; `/analyze` accepts `page_layout`
 
 ## PDF Layout Improvements — DONE (Jul 3 2026)
 - pdfplumber replaces PyMuPDF get_text("dict") for text extraction in /page_layout
 - 2-column detection: horizontal gap scan in middle 40% of page, gutter threshold = 3% of page width
 - Primary column ordering: column with more words goes first (article body before sidebar)
-- Image-zone text filtering: words overlapping images by > 30% of word width are excluded
+- Image-zone text filtering: words overlapping inset images by > 45% of word width are excluded
 - Font-size gap clustering for heading detection in detectTopics() (pdfUtils.js)
 - Image-primary page handling for cover/ad/photo pages (< 50 words + images)
 - Tested against Discovery Nov 2021 (97 pages): 61 single-col, 12 two-col, 14 image-heavy, 10 covers
 
-## Image Upscaling — DONE (Jul 2 2026, face-aware Jul 6 2026)
-- `/upscale_image` POST endpoint in tts_server.py; routes to Kaggle when `UPSCALE_PROVIDER=kaggle`
-- `server/upscale_service.py` — shared face-aware routing (YuNet + Lanczos/ESRGAN)
-- `server/rrdb_net.py` — minimal RRDBNet architecture (pure torch, no basicsr dependency)
-- Model: RealESRGAN_x4plus.pth (~67MB) in server/models/ — 4× upscale, 23 RRDB blocks
-- YuNet: `server/data/face_detection_yunet_2023mar.onnx` — OpenCV 5 FaceDetectorYN
-- Tiled ESRGAN inference (256px tiles, 10px pad) keeps peak RAM ~1GB on CPU
-- Input capped at 600px max side before ESRGAN; tiny threshold = 400px (`ESRGAN_SIZE_THRESHOLD`)
+## Image Upscaling — DONE (Jul 2 2026, Lanczos-only Jul 8 2026)
+- `/upscale_image` POST endpoint in tts_server.py — **laptop CPU only**
+- `server/upscale_service.py` — YuNet/HOG people-aware Lanczos routing (no ESRGAN)
 - Frontend: `upscaleImages()` in pdfUtils.js fires concurrently after page layout loads;
   upscaled data-URLs swap into pageDeck.images + topics[*].image once ready (progressive enhancement)
 
-## Kaggle GPU Offloading — DONE (Jul 4 2026, translate/upscale fixes Jul 6 2026)
+## Kaggle GPU Offloading — DONE (Jul 4 2026, 7B + publish Jul 8 2026)
 - `server/kaggle/veda_gpu_server.py` — FastAPI on Kaggle T4 x2 + cloudflared tunnel
-- Kaggle dataset `project-models` bundle via `prepare_kaggle_dataset.bat`:
-  Qwen GGUF, RealESRGAN, rrdb_net.py, analyze_prompts.py, page_layout_service.py,
-  upscale_service.py, veda_gpu_server.py, data/face_detection_yunet_2023mar.onnx
-- Laptop routes layout/analyze/translate/upscale to Kaggle when enabled; local fallback preserved
+- Kaggle dataset `project-models` via `prepare_kaggle_dataset.bat` + `publish_kaggle_dataset.bat`:
+  7B GGUF, analyze_prompts.py, page_layout_service.py, qwen_config.py, security.py, veda_gpu_server.py
+- Laptop routes layout/analyze/translate to Kaggle when enabled; local fallback preserved
 - `server/test_kaggle.py --compare` benchmarks local vs Kaggle `/analyze`
 - pip package for Kaggle LLM: `llama-cpp-python` (NOT `llama_cpp`) with CUDA wheels
-- Kaggle also installs at runtime: opencv-python-headless, pdfplumber, pymupdf, transformers
-- Keep Sarvam + HeyGen unchanged — TTS stays on laptop (Sarvam primary, edge-tts fallback)
+- Kaggle installs at runtime: pdfplumber, pymupdf, transformers
+- Keep Sarvam unchanged — TTS stays on laptop (Sarvam primary, edge-tts fallback)
 - Translation on Kaggle: NLLB-600M on GPU 1; pre-warm; batched translate; `max_new_tokens`
-- Turn ON: start notebook → Run All → copy tunnel URL → `.env` → restart `tts_server.py`
-- Turn OFF: stop notebook → `KAGGLE_ENABLED=false`, all providers=`local` → restart backend
+- Turn ON: publish bundle → attach latest dataset → Run notebook → copy tunnel URL → `.env` → restart backend
+- Turn OFF: stop notebook → `KAGGLE_ENABLED=false` → restart backend
 
 ---
 
