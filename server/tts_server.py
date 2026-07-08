@@ -36,11 +36,11 @@ from kaggle_client import (
     kaggle_status,
     kaggle_translate,
     kaggle_upload_pdf,
-    kaggle_upscale_image,
     resolve_provider,
     should_use_kaggle,
 )
 from page_layout_service import PDFMetadataAnalyzer, extract_page_layout
+from qwen_config import get_local_qwen_gguf_info
 from security import (
     MAX_ANALYZE_TEXT_CHARS,
     MAX_IMAGE_PIXELS,
@@ -492,20 +492,8 @@ def resolve_model_path(model_paths: list[Path]) -> Path | None:
 
 # Shared LLM state
 def get_selected_model_info() -> tuple[str, str, list[Path]]:
-    size = os.environ.get("LOCAL_LLM_SIZE", "0.5B").strip().upper()
-    if size == "1.5B":
-        filename = "qwen2.5-1.5b-instruct-q4_k_m.gguf"
-        url = "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf"
-    elif size == "3B":
-        filename = "qwen2.5-3b-instruct-q4_k_m.gguf"
-        url = "https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/main/qwen2.5-3b-instruct-q4_k_m.gguf"
-    else:  # Default to 0.5B
-        filename = "qwen2.5-0.5b-instruct-q4_k_m.gguf"
-        url = "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf"
-        
-    model_paths = [
-        BASE_DIR / "models" / filename,
-    ]
+    _size, filename, url = get_local_qwen_gguf_info()
+    model_paths = [BASE_DIR / "models" / filename]
     return filename, url, model_paths
 
 class LLMState:
@@ -604,40 +592,12 @@ def translate_strings_indictrans2(texts: list[str], target_lang: str = "tel_Telu
     print(f"NLLB-200 translated {len(texts)} strings to {target_lang} in {elapsed:.1f}s (max_len={dynamic_max_length})")
     return result
 
-ESRGAN_MODEL_PATH = BASE_DIR / "models" / "RealESRGAN_x4plus.pth"
-
-class ESRGANState:
-    """Lazy-load singleton for the Real-ESRGAN 4× upscaler."""
-    _model = None
-    _lock = threading.Lock()
-
-    @classmethod
-    def get_model(cls):
-        if cls._model is not None:
-            return cls._model
-        with cls._lock:
-            if cls._model is not None:
-                return cls._model
-            import torch
-            sys.path.insert(0, str(BASE_DIR))
-            from rrdb_net import RRDBNet
-            print("Loading Real-ESRGAN model (RealESRGAN_x4plus.pth) …")
-            model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=4)
-            state = torch.load(str(ESRGAN_MODEL_PATH), map_location="cpu")
-            weights = state.get("params_ema", state.get("params", state))
-            model.load_state_dict(weights, strict=True)
-            model.eval()
-            print("Real-ESRGAN model loaded.")
-            cls._model = model
-            return cls._model
-
-
-def analyze_text_semantic_local(text: str, is_digest: bool = False, language: str = "en-US") -> dict:
+def analyze_text_semantic_local(text: str, is_digest: bool = False, language: str = "en-US", page_layout: str = "plain") -> dict:
     llm = LLMState.get_llm()
     if llm is None:
         raise Exception("LLM model not available yet.")
 
-    messages = build_analyze_messages(text, is_digest=is_digest)
+    messages = build_analyze_messages(text, is_digest=is_digest, page_layout=page_layout)
 
     with LLMState._lock:
         response = llm.create_chat_completion(
@@ -658,19 +618,26 @@ def analyze_text_semantic_local(text: str, is_digest: bool = False, language: st
         raise Exception(f"Failed to parse JSON response from local LLM: {e}") from e
 
 
-def run_semantic_analysis(text: str, is_digest: bool = False, language: str = "en-US") -> dict:
+def run_semantic_analysis(
+    text: str,
+    is_digest: bool = False,
+    language: str = "en-US",
+    page_layout: str = "plain",
+) -> dict:
     provider = resolve_provider("LLM_PROVIDER", "auto")
 
     if should_use_kaggle(provider):
         try:
             print(f"Calling Kaggle GPU /analyze (is_digest={is_digest}) …")
-            return kaggle_analyze(text, is_digest=is_digest)
+            return kaggle_analyze(text, is_digest=is_digest, page_layout=page_layout)
         except Exception as kaggle_err:
             if provider == "kaggle":
                 raise
             print(f"Kaggle analyze failed ({kaggle_err}); falling back to local LLM …")
 
-    return analyze_text_semantic_local(text, is_digest=is_digest, language=language)
+    return analyze_text_semantic_local(
+        text, is_digest=is_digest, language=language, page_layout=page_layout
+    )
 
 
 def translate_strings_for_deck(texts: list[str], target_lang: str) -> list[str]:
@@ -696,6 +663,7 @@ class AnalyzeRequest(BaseModel):
     text: str
     is_digest: bool = False
     language: str = "en-US"
+    page_layout: str = "plain"
 
 class TranslateDeckRequest(BaseModel):
     deck: dict
@@ -1059,7 +1027,12 @@ def analyze_text(req: AnalyzeRequest):
         print(f"Starting LLM analysis ({mode}, backend={backend}, language: {req.language}) for {len(text)} chars...")
 
         # We always generate the semantic structure in English first for high accuracy
-        analysis = run_semantic_analysis(text, is_digest=req.is_digest, language="en-US")
+        analysis = run_semantic_analysis(
+            text,
+            is_digest=req.is_digest,
+            language="en-US",
+            page_layout=req.page_layout,
+        )
         sarvam_credits_exhausted = False
         
         # If Telugu is selected, translate via IndicTrans2 (local) with Sarvam as fallback
@@ -1287,18 +1260,13 @@ async def transcribe_audio(req: TranscribeRequest):
 @app.post("/upscale_image")
 async def upscale_image(request: Request):
     """
-    Upscale a base64-encoded image and return a sharper version.
-
-    Face-aware routing (see upscale_service.py):
-      • Faces detected → Lanczos (×4 if tiny, ×2 otherwise) — no AI on people
-      • No faces + tiny → Real-ESRGAN ×4 when model weights are present
-      • No faces + normal size → Lanczos ×2 + Unsharp Mask
+    Upscale a base64-encoded image using face-aware Lanczos (no AI model).
 
     Request body (JSON):
         { "image": "<base64 PNG or JPEG>", "format": "png" | "jpeg" }
 
     Response (JSON):
-        { "image": "<base64 upscaled image>", "method": "lanczos_people_x4" | "lanczos_x2" | "esrgan" }
+        { "image": "<base64 upscaled image>", "method": "lanczos_people_x4" | "lanczos_x2" | ... }
     """
     try:
         from PIL import Image
@@ -1323,25 +1291,10 @@ async def upscale_image(request: Request):
     pil_img = Image.open(BytesIO(img_bytes)).convert("RGB")
 
     w, h = pil_img.width, pil_img.height
-    upscale_provider = resolve_provider("UPSCALE_PROVIDER", "local")
-
-    if should_use_kaggle(upscale_provider):
-        try:
-            print(f"/upscale_image: forwarding {w}×{h} px to Kaggle GPU …")
-            return kaggle_upscale_image(body.get("image", ""), fmt)
-        except Exception as kaggle_err:
-            if upscale_provider == "kaggle":
-                raise HTTPException(status_code=502, detail=str(kaggle_err)) from kaggle_err
-            print(f"Kaggle upscale failed ({kaggle_err}); using local upscaler …")
-
-    esrgan_model = ESRGANState.get_model() if ESRGAN_MODEL_PATH.exists() else None
-    print(f"/upscale_image: input {w}×{h} px, esrgan={'yes' if esrgan_model else 'no'}, fmt={fmt}")
+    print(f"/upscale_image: input {w}×{h} px (Lanczos), fmt={fmt}")
 
     loop = asyncio.get_event_loop()
-    out_pil, method = await loop.run_in_executor(
-        None,
-        lambda: run_face_aware_upscale(pil_img, esrgan_model=esrgan_model),
-    )
+    out_pil, method = await loop.run_in_executor(None, lambda: run_face_aware_upscale(pil_img))
 
     buf = BytesIO()
     if fmt == "jpeg":

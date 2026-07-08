@@ -36,7 +36,7 @@ veda/
 │   ├── security.py            # Shared limits, validation, CORS helpers
 │   ├── analyze_prompts.py     # LLM prompts + JSON extract
 │   ├── page_layout_service.py # PDF layout extraction
-│   ├── upscale_service.py     # Face-aware upscaling (YuNet + ESRGAN)
+│   ├── upscale_service.py     # Face-aware Lanczos upscaling (local CPU)
 │   └── kaggle/
 │       ├── veda_gpu_server.py           # Run in Kaggle notebook (GPU T4 x2)
 │       ├── prepare_kaggle_dataset.bat     # Build veda-models bundle locally

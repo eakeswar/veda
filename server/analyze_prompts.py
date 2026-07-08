@@ -5,7 +5,14 @@ import json
 import re
 
 
-def build_analyze_messages(text: str, is_digest: bool = False) -> list[dict]:
+def build_analyze_messages(
+    text: str,
+    is_digest: bool = False,
+    page_layout: str = "plain",
+) -> list[dict]:
+    if page_layout == "plain" and "[HEADLINE]" in text:
+        page_layout = "structured"
+
     noise_exclusion = (
         "Never include page numbers, running headers, footers, publication dates, "
         "captions, image labels, or any repeating metadata in any field.\n"
@@ -14,6 +21,24 @@ def build_analyze_messages(text: str, is_digest: bool = False) -> list[dict]:
         "You are narrating an educational presentation for curious students aged 14–18. "
         "Use clear, engaging language — avoid jargon unless you briefly explain it.\n"
     )
+
+    structured_hints = ""
+    if page_layout in ("structured", "qa"):
+        structured_hints = (
+            "The user text is a STRUCTURED page extract. Each line is tagged:\n"
+            "- [HEADLINE] — main title lines; merge ALL headline lines into one natural title.\n"
+            "- [SUBHEAD] — section subheading (use for subtitle when present).\n"
+            "- [BODY] — main explanatory text (primary source for summary and highlights).\n"
+            "- [CALLOUT] — diagram labels or side notes (use only if relevant).\n"
+            "Respect reading order. Do not repeat headline fragments in subtitle or summary.\n"
+        )
+        if page_layout == "qa":
+            structured_hints += (
+                "This is a magazine Q&A / 'Did you know?' callout page. "
+                "The title should be the full question in natural English "
+                "(e.g. 'Is it really true that stars are twinkling?'). "
+                "Use SUBHEAD lines for the section label. Answer using BODY text only.\n"
+            )
 
     if is_digest:
         system_instructions = (
@@ -38,10 +63,16 @@ def build_analyze_messages(text: str, is_digest: bool = False) -> list[dict]:
             "\"narration\": \"Welcome to Science Updates. This week we have four fascinating stories ...\"}"
         )
     else:
+        title_rule = (
+            "The main topic — concise, under 12 words."
+            if page_layout in ("structured", "qa")
+            else "The main topic — concise, under 8 words."
+        )
         system_instructions = (
             f"{audience}"
+            f"{structured_hints}"
             "Convert the user's text into a slide JSON object with exactly these fields:\n"
-            "- \"title\": The main topic — concise, under 8 words.\n"
+            f"- \"title\": {title_rule}\n"
             "- \"subtitle\": A compelling subheading — under 12 words.\n"
             "- \"summary\": Two clear sentences (30–50 words total) explaining the core concept.\n"
             "- \"highlights\": An array of exactly 3 bullet points — key takeaways, 12–25 words each, "

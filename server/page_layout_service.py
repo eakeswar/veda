@@ -116,6 +116,21 @@ def _extract_lines_pymupdf(page_obj, width, height, active_analyzer):
     return lines
 
 
+def _content_image_rects(img_rects_topdown, width, height):
+    """Image rects that should suppress overlapping text (exclude full-page backgrounds)."""
+    page_area = width * height or 1
+    content = []
+    for x0, y0, x1, y1 in img_rects_topdown:
+        w = x1 - x0
+        h = y1 - y0
+        if w > width * 0.85 or h > height * 0.85:
+            continue
+        if w * h > page_area * 0.45:
+            continue
+        content.append((x0, y0, x1, y1))
+    return content
+
+
 def _group_words_into_lines(words):
     """Group pdfplumber word dicts into lines by proximity of their `top` coordinate."""
     if not words:
@@ -168,15 +183,17 @@ def _extract_lines_pdfplumber(pdf_path, page_num, img_rects_topdown, width, heig
         if not words:
             return []
 
-        # Filter words that substantially overlap any image zone (> 30 % of word width)
+        # Filter words overlapping inset photos/diagrams — not decorative backgrounds.
+        filter_rects = _content_image_rects(img_rects_topdown, width, height)
+
         def _overlaps_image(w):
             wx0, wy0, wx1, wy1 = w["x0"], w["top"], w["x1"], w["bottom"]
-            for (ix0, iy0, ix1, iy1) in img_rects_topdown:
+            for (ix0, iy0, ix1, iy1) in filter_rects:
                 ox = min(wx1, ix1) - max(wx0, ix0)
                 oy = min(wy1, iy1) - max(wy0, iy0)
                 if ox > 0 and oy > 0:
                     word_w = wx1 - wx0 or 1
-                    if ox / word_w > 0.3:
+                    if ox / word_w > 0.45:
                         return True
             return False
 

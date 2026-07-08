@@ -57,6 +57,7 @@ def _print_env():
         "TRANSLATE_PROVIDER",
         "UPSCALE_PROVIDER",
         "LOCAL_LLM_SIZE",
+        "KAGGLE_LLM_SIZE",
     ):
         val = os.environ.get(key, "")
         if key == "KAGGLE_API_SECRET" and val:

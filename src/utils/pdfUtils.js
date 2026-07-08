@@ -133,7 +133,174 @@ function dedupeLines(lines) {
   })
 }
 
+function cleanHeadlineText(text) {
+  if (!text) return ''
+  return text
+    .replace(/^\.\.\.\s*/, '')
+    .replace(/\s*\.\.\.\s*$/, '')
+    .replace(/\s*\.\.\.\s+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+/** Collapse lines where one normalized text is a substring of another. */
+function collapsePartialDuplicateLines(lines) {
+  const result = []
+
+  for (const line of lines) {
+    const norm = normalizeText(line.text)
+    if (!norm) continue
+
+    let replaced = false
+    for (let i = 0; i < result.length; i++) {
+      const existingNorm = normalizeText(result[i].text)
+      if (existingNorm === norm) {
+        replaced = true
+        break
+      }
+      if (existingNorm.includes(norm) || norm.includes(existingNorm)) {
+        if (norm.length >= existingNorm.length) {
+          result[i] = line
+        }
+        replaced = true
+        break
+      }
+    }
+
+    if (!replaced) {
+      result.push(line)
+    }
+  }
+
+  return result
+}
+
+/**
+ * Merge vertically stacked magazine headline lines (e.g. "IS IT REALLY TRUE THAT …"
+ * + "… stars are twinkling?") into a single line.
+ */
+function mergeStackedHeadlineLines(lines) {
+  if (lines.length <= 1) return lines
+
+  const sorted = [...lines].sort((a, b) => b.y - a.y)
+  const maxFont = Math.max(...sorted.map((l) => l.fontSize))
+  const headlineMinSize = maxFont * 0.82
+  const consumed = new Set()
+  const mergedLines = []
+
+  for (let i = 0; i < sorted.length; i++) {
+    if (consumed.has(i)) continue
+
+    const line = sorted[i]
+    const wordCount = line.text.split(/\s+/).filter(Boolean).length
+    const isHeadline = line.fontSize >= headlineMinSize && wordCount <= 14
+
+    if (!isHeadline) {
+      mergedLines.push(line)
+      continue
+    }
+
+    const parts = [line]
+    consumed.add(i)
+
+    for (let j = i + 1; j < sorted.length; j++) {
+      if (consumed.has(j)) continue
+
+      const next = sorted[j]
+      const nextWords = next.text.split(/\s+/).filter(Boolean).length
+      const vertGap = Math.abs(parts[parts.length - 1].y - next.y)
+      const similarSize = Math.abs(parts[0].fontSize - next.fontSize) <= 2.5
+      const continuation =
+        /^\.\.\./.test(next.text.trim()) ||
+        /\.\.\.\s*$/.test(parts[parts.length - 1].text.trim())
+      const isNextHeadline = next.fontSize >= headlineMinSize && nextWords <= 14
+
+      if (vertGap <= 90 && similarSize && isNextHeadline && (continuation || vertGap <= 70)) {
+        parts.push(next)
+        consumed.add(j)
+      }
+    }
+
+    if (parts.length > 1) {
+      mergedLines.push({
+        text: cleanHeadlineText(parts.map((p) => p.text).join(' ')),
+        x: Math.min(...parts.map((p) => p.x)),
+        y: Math.max(...parts.map((p) => p.y)),
+        fontSize: Math.max(...parts.map((p) => p.fontSize)),
+        _mergedHeadline: true,
+      })
+    } else {
+      mergedLines.push(line)
+    }
+  }
+
+  return sortLinesByReadingOrder(mergedLines)
+}
+
+/** Magazine Q&A / "Did you know?" callout pages (large question + multi-column body). */
+function detectCalloutPage(lines) {
+  if (lines.length < 5) return false
+
+  const maxFont = Math.max(...lines.map((l) => l.fontSize))
+  const topLines = [...lines].sort((a, b) => b.y - a.y).slice(0, 5)
+  const hasLargeHeadline = topLines.some((l) => l.fontSize >= maxFont * 0.85)
+  const hasQuestion = lines.some(
+    (l) =>
+      /\?\s*$/.test(l.text.trim()) ||
+      /is it really true/i.test(l.text) ||
+      l._mergedHeadline
+  )
+  const xSpread = Math.max(...lines.map((l) => l.x)) - Math.min(...lines.map((l) => l.x))
+
+  return hasLargeHeadline && hasQuestion && xSpread > 100
+}
+
+function lineRoleForAnalyze(line, { headlineMin, subheadMin }) {
+  const words = line.text.split(/\s+/).filter(Boolean).length
+  if (line._mergedHeadline || (line.fontSize >= headlineMin && words <= 16)) {
+    return 'HEADLINE'
+  }
+  if (line.fontSize >= subheadMin && words <= 18) {
+    return 'SUBHEAD'
+  }
+  if (words <= 8 && line.fontSize >= subheadMin * 0.92) {
+    return 'CALLOUT'
+  }
+  return 'BODY'
+}
+
+/** Format extracted lines with layout roles for the LLM (preserves structure). */
+function buildStructuredAnalyzeText(lines, { isCallout = false } = {}) {
+  if (!lines.length) return ''
+
+  const sizes = lines.map((l) => l.fontSize)
+  const maxFont = Math.max(...sizes)
+  const median = [...sizes].sort((a, b) => a - b)[Math.floor(sizes.length / 2)] || 12
+  const headlineMin = maxFont * 0.82
+  const subheadMin = Math.max(median * 1.2, maxFont * 0.55)
+
+  const ordered = sortLinesByReadingOrder(lines)
+  const roles = ordered.map((line) =>
+    lineRoleForAnalyze(line, { headlineMin, subheadMin })
+  )
+
+  const header = isCallout
+    ? 'Page layout: magazine Q&A callout. Merge all HEADLINE lines into one natural question title.\n\n'
+    : 'Page layout: structured extract. Lines are tagged by role — use HEADLINE for title, SUBHEAD for subtitle.\n\n'
+
+  const body = ordered
+    .map((line, idx) => `[${roles[idx]}] ${line.text.trim()}`)
+    .join('\n')
+
+  return `${header}${body}`.trim()
+}
+
 function buildTitle(lines, fallbackTitle) {
+  const mergedHeadline = lines.find((line) => line._mergedHeadline)
+  if (mergedHeadline?.text) {
+    return cleanHeadlineText(mergedHeadline.text)
+  }
+
   const candidates = [...lines]
     .filter((line) => line.text.length > 4 && !/discovery|november|contents/i.test(line.text))
     .sort((a, b) => b.fontSize - a.fontSize || a.y - b.y)
@@ -149,7 +316,14 @@ function buildSubtitle(lines, title) {
   const normalizedTitle = normalizeText(title)
 
   const candidates = lines
-    .filter((line) => normalizeText(line.text) !== normalizedTitle && line.text.length > 10)
+    .filter((line) => {
+      const norm = normalizeText(line.text)
+      if (!norm || norm === normalizedTitle) return false
+      if (line._mergedHeadline) return false
+      if (normalizedTitle.includes(norm) && norm.length > 12) return false
+      if (norm.includes(normalizedTitle) && normalizedTitle.length > 12) return false
+      return line.text.length > 10
+    })
     .sort((a, b) => b.fontSize - a.fontSize || a.y - b.y)
 
   return candidates[0]?.text ?? ''
@@ -723,10 +897,11 @@ export async function extractPageText(pdfDoc, pageNumber) {
 }
 
 export async function fetchSemanticAnalysis(sourceText, fallbackTitle = '', isDigest = false, language = 'en-US', options = {}) {
-  const { onSarvamCreditsExhausted } = options
-  // If the page contains very little content (under 30 words), skip the local LLM
+  const { onSarvamCreditsExhausted, structuredText, pageLayout = 'plain' } = options
+  const analyzeText = (structuredText || sourceText || '').trim()
+  // If the page contains very little content (under 50 words), skip the local LLM
   // to avoid hallucinations or system instructions reflections.
-  const wordCount = sourceText ? sourceText.trim().split(/\s+/).filter(Boolean).length : 0
+  const wordCount = analyzeText ? analyzeText.trim().split(/\s+/).filter(Boolean).length : 0
   if (wordCount < 50) {
     return null
   }
@@ -736,7 +911,12 @@ export async function fetchSemanticAnalysis(sourceText, fallbackTitle = '', isDi
     const response = await fetch(ANALYZE_URL, {
       method: 'POST',
       headers: apiHeaders({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify({ text: sourceText, is_digest: isDigest, language }),
+      body: JSON.stringify({
+        text: analyzeText,
+        is_digest: isDigest,
+        language,
+        page_layout: pageLayout,
+      }),
     })
 
     if (response.ok) {
@@ -857,6 +1037,13 @@ export async function fetchTeluguDeck(deck, options = {}) {
   }
 }
 
+function prepareLayoutLines(rawLines) {
+  let lines = dedupeLines(rawLines || [])
+  lines = collapsePartialDuplicateLines(lines)
+  lines = mergeStackedHeadlineLines(lines)
+  return lines
+}
+
 export async function extractPagePresentation(pdfDoc, pageNumber, fallbackTitle = '') {
   if (!pageNumber || pageNumber < 1 || pageNumber > pdfDoc.numPages) {
     return null
@@ -866,6 +1053,8 @@ export async function extractPagePresentation(pdfDoc, pageNumber, fallbackTitle 
   let imagesData = []
   let images = []
   let sourceText = ''
+  let analyzeText = ''
+  let pageLayout = 'plain'
   let fetchedBackend = false
 
   // 1. Try backend layout parser
@@ -874,9 +1063,13 @@ export async function extractPagePresentation(pdfDoc, pageNumber, fallbackTitle 
     const response = await fetch(LAYOUT_URL, { headers: apiHeaders() })
     if (response.ok) {
       const data = await response.json()
-      lines = dedupeLines(data.lines)
+      lines = prepareLayoutLines(data.lines)
       const rawSourceText = lines.map((line) => line.text).join(' ').replace(/\s+/g, ' ').trim()
       sourceText = cleanSplitWords(rawSourceText)
+      analyzeText = buildStructuredAnalyzeText(lines, {
+        isCallout: detectCalloutPage(lines),
+      })
+      pageLayout = detectCalloutPage(lines) ? 'qa' : 'structured'
       imagesData = data.images
       images = data.images.map((img) => img.url)
       fetchedBackend = true
@@ -906,9 +1099,13 @@ export async function extractPagePresentation(pdfDoc, pageNumber, fallbackTitle 
       return true // Include body text
     })
 
-    lines = dedupeLines(buildStructuredLines(filteredItems))
+    lines = prepareLayoutLines(buildStructuredLines(filteredItems))
     const rawSourceText = lines.map((line) => line.text).join(' ').replace(/\s+/g, ' ').trim()
     sourceText = cleanSplitWords(rawSourceText)
+    analyzeText = buildStructuredAnalyzeText(lines, {
+      isCallout: detectCalloutPage(lines),
+    })
+    pageLayout = detectCalloutPage(lines) ? 'qa' : 'structured'
     imagesData = await extractPageImages(page)
     images = imagesData.map((img) => img.url)
   }
@@ -961,6 +1158,8 @@ export async function extractPagePresentation(pdfDoc, pageNumber, fallbackTitle 
       highlights,
       supportingPoints,
       sourceText,
+      analyzeText: buildStructuredAnalyzeText(lines),
+      pageLayout: 'structured',
       images: matchedImages,
       narration: intro ? `${intro} ${buildDigestNarration(topics)}`.replace(/\s+/g, ' ').trim() : buildDigestNarration(topics),
     }
@@ -970,14 +1169,26 @@ export async function extractPagePresentation(pdfDoc, pageNumber, fallbackTitle 
   // Single-topic heuristic fallback (unchanged)
   const title = buildTitle(lines, fallbackTitle)
   const subtitle = buildSubtitle(lines, title)
-  const sentences = splitIntoSentences(sourceText)
+  const bodyLines = lines.filter(
+    (line) =>
+      !line._mergedHeadline &&
+      normalizeText(line.text) !== normalizeText(title) &&
+      normalizeText(line.text) !== normalizeText(subtitle)
+  )
+  const bodySourceText = bodyLines.map((l) => l.text).join(' ').replace(/\s+/g, ' ').trim()
+  const sentences = splitIntoSentences(bodySourceText || sourceText)
   const summarySentences = sentences.slice(0, 2)
   const summary = summarySentences.join(' ')
   const highlights = buildHighlights(sentences, summarySentences)
-  const supportingPoints = lines
-    .filter((line) => line.text !== title && line.text !== subtitle && line.text.length > 18)
+  const supportingPoints = bodyLines
+    .filter((line) => line.text.length > 18)
     .slice(0, 8)
     .map((line) => line.text)
+
+  if (!analyzeText) {
+    analyzeText = buildStructuredAnalyzeText(lines, { isCallout: detectCalloutPage(lines) })
+    pageLayout = detectCalloutPage(lines) ? 'qa' : 'structured'
+  }
 
   return {
     isDigest: false,
@@ -987,6 +1198,8 @@ export async function extractPagePresentation(pdfDoc, pageNumber, fallbackTitle 
     highlights,
     supportingPoints,
     sourceText,
+    analyzeText,
+    pageLayout,
     images,
     narration: buildNarration(title, summary),
   }
@@ -1099,7 +1312,7 @@ function matchImagesToTopicsGlobal(topics, imagesData) {
 const API_BASE = API.base
 
 /**
- * Upscale an array of base64 image data-URLs via Real-ESRGAN on the backend.
+ * Upscale an array of base64 image data-URLs via face-aware Lanczos on the backend.
  * Requests run concurrently. Any image that fails falls back to its original.
  * Returns a new array of the same length with upscaled (or original) data-URLs.
  */

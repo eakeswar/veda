@@ -1,8 +1,8 @@
-"""Face- and person-aware image upscaling for Veda PDF slide images.
+"""Face- and person-aware image upscaling for Veda PDF slide images (Lanczos only).
 
 Routing:
-  • Faces or full bodies detected → Lanczos (×4 if tiny, ×2 otherwise) — no AI hallucination on people
-  • No people + tiny            → Real-ESRGAN ×4 when a model is available
+  • Faces or full bodies detected → Lanczos (×4 if tiny, ×2 otherwise)
+  • No people + tiny            → Lanczos ×4 + Unsharp Mask
   • No people + normal size     → Lanczos ×2 + Unsharp Mask
 """
 from __future__ import annotations
@@ -16,10 +16,7 @@ VENDOR_DIR = BASE_DIR / "vendor"
 if VENDOR_DIR.exists() and str(VENDOR_DIR) not in sys.path:
     sys.path.insert(0, str(VENDOR_DIR))
 
-ESRGAN_SIZE_THRESHOLD = int(os.environ.get("ESRGAN_SIZE_THRESHOLD", "400"))
-MAX_ESRGAN_INPUT_PX = 600
-ESRGAN_TILE_SIZE = 256
-ESRGAN_TILE_PAD = 10
+TINY_SIZE_THRESHOLD = int(os.environ.get("TINY_SIZE_THRESHOLD", os.environ.get("ESRGAN_SIZE_THRESHOLD", "400")))
 FACE_SCORE_THRESHOLD = float(os.environ.get("FACE_SCORE_THRESHOLD", "0.45"))
 
 FACE_MODEL_NAMES = (
@@ -160,93 +157,26 @@ def lanczos_upscale(pil_img, scale: int = 2):
     return upscaled.filter(ImageFilter.UnsharpMask(radius=1.5, percent=60, threshold=3))
 
 
-def esrgan_upscale(img_np, model, device=None):
-    """Run Real-ESRGAN 4× on a uint8 HWC RGB numpy array."""
-    import numpy as np
-    import torch
-
-    h, w = img_np.shape[:2]
-    img_t = torch.from_numpy(img_np.astype(np.float32) / 255.0).permute(2, 0, 1).unsqueeze(0)
-    if device is not None:
-        img_t = img_t.to(device)
-        model = model.to(device)
-
-    tile = ESRGAN_TILE_SIZE
-    pad = ESRGAN_TILE_PAD
-    scale = 4
-    out_h, out_w = h * scale, w * scale
-    output = torch.zeros(1, 3, out_h, out_w, dtype=torch.float32, device=img_t.device)
-
-    tiles_x = max(1, (w + tile - 1) // tile)
-    tiles_y = max(1, (h + tile - 1) // tile)
-
-    with torch.no_grad():
-        for iy in range(tiles_y):
-            for ix in range(tiles_x):
-                x0 = ix * tile
-                y0 = iy * tile
-                x1 = min(x0 + tile, w)
-                y1 = min(y0 + tile, h)
-
-                px0 = max(x0 - pad, 0)
-                py0 = max(y0 - pad, 0)
-                px1 = min(x1 + pad, w)
-                py1 = min(y1 + pad, h)
-
-                tile_in = img_t[:, :, py0:py1, px0:px1]
-                tile_out = model(tile_in)
-
-                ox0 = (x0 - px0) * scale
-                oy0 = (y0 - py0) * scale
-                ox1 = ox0 + (x1 - x0) * scale
-                oy1 = oy0 + (y1 - y0) * scale
-
-                output[:, :, y0 * scale:y1 * scale, x0 * scale:x1 * scale] = tile_out[:, :, oy0:oy1, ox0:ox1]
-
-    out_np = output.squeeze(0).permute(1, 2, 0).clamp(0, 1).cpu().numpy()
-    return (out_np * 255).astype(np.uint8)
+def decide_upscale_method(width: int, height: int) -> int:
+    """Return Lanczos scale factor (2 or 4)."""
+    is_tiny = width < TINY_SIZE_THRESHOLD or height < TINY_SIZE_THRESHOLD
+    return 4 if is_tiny else 2
 
 
-def decide_upscale_method(width: int, height: int, has_people: bool, esrgan_available: bool) -> tuple[str, int]:
-    """Return (method, lanczos_scale). method is 'lanczos' or 'esrgan'."""
-    is_tiny = width < ESRGAN_SIZE_THRESHOLD or height < ESRGAN_SIZE_THRESHOLD
-    if has_people:
-        return "lanczos", (4 if is_tiny else 2)
-    if is_tiny and esrgan_available:
-        return "esrgan", 4
-    if is_tiny:
-        return "lanczos", 4
-    return "lanczos", 2
-
-
-def upscale_image(pil_img, *, esrgan_model=None, device=None):
+def upscale_image(pil_img):
     """
-    Upscale a PIL RGB image using face/person-aware routing.
+    Upscale a PIL RGB image using face/person-aware Lanczos routing.
 
     Returns (output_pil, method_name).
     """
-    import numpy as np
-    from PIL import Image
-
     w, h = pil_img.size
     has_people, people_reason = detect_people(pil_img)
-    esrgan_available = esrgan_model is not None
-    method, lanczos_scale = decide_upscale_method(w, h, has_people, esrgan_available)
+    lanczos_scale = decide_upscale_method(w, h)
 
     if has_people:
         print(f"Upscale {w}×{h}: people detected ({people_reason}) → Lanczos ×{lanczos_scale}")
-    elif method == "esrgan":
-        print(f"Upscale {w}×{h}: no people → Real-ESRGAN ×4")
     else:
         print(f"Upscale {w}×{h}: no people → Lanczos ×{lanczos_scale}")
-
-    if method == "esrgan":
-        work_img = pil_img
-        if w > MAX_ESRGAN_INPUT_PX or h > MAX_ESRGAN_INPUT_PX:
-            work_img = pil_img.copy()
-            work_img.thumbnail((MAX_ESRGAN_INPUT_PX, MAX_ESRGAN_INPUT_PX), Image.LANCZOS)
-        upscaled_np = esrgan_upscale(np.array(work_img), esrgan_model, device=device)
-        return Image.fromarray(upscaled_np), "esrgan"
 
     out = lanczos_upscale(pil_img, lanczos_scale)
     if has_people:

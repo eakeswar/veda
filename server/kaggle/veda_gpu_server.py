@@ -5,9 +5,7 @@ Veda GPU inference server — run inside a Kaggle notebook (GPU T4 x2).
 Setup (one-time):
   1. Create a Kaggle Dataset "veda-models" with:
        - qwen2.5-3b-instruct-q4_k_m.gguf  (or 1.5B / 0.5B)
-       - RealESRGAN_x4plus.pth            (optional, for /upscale_image)
-       - rrdb_net.py                      (copy from server/rrdb_net.py)
-       - analyze_prompts.py               (copy from server/analyze_prompts.py)
+       - analyze_prompts.py, page_layout_service.py, security.py
   2. New Kaggle notebook → Settings:
        - Accelerator: GPU T4 x2
        - Internet: ON
@@ -16,117 +14,117 @@ Setup (one-time):
        KAGGLE_API_BASE_URL=https://xxxx.trycloudflare.com
        KAGGLE_API_SECRET=your-secret
        LLM_PROVIDER=kaggle
-       UPSCALE_PROVIDER=kaggle
+       TRANSLATE_PROVIDER=kaggle
 
 Stop the notebook session when done — GPU hours tick while the session is open.
 """
 from __future__ import annotations
 
+import logging
 import os
 import re
 import subprocess
 import sys
 import threading
 import time
+import warnings
 from io import BytesIO
 from pathlib import Path
+
+# ── Quiet startup (Kaggle notebook cell output) ───────────────────────────────
+def _configure_quiet_startup() -> None:
+    os.environ.setdefault("PIP_PROGRESS_BAR", "off")
+    os.environ.setdefault("PIP_DISABLE_PIP_VERSION_CHECK", "1")
+    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+    os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    os.environ.setdefault("TQDM_DISABLE", "1")
+    for name in ("transformers", "huggingface_hub", "filelock", "urllib3"):
+        logging.getLogger(name).setLevel(logging.ERROR)
+    warnings.filterwarnings("ignore", message=".*tie_word_embeddings.*")
+    warnings.filterwarnings("ignore", message=".*unauthenticated requests to the HF Hub.*")
+
+
+def _quiet() -> bool:
+    return os.environ.get("VEDA_QUIET", "1").strip().lower() not in ("0", "false", "no")
+
+
+def _log(msg: str) -> None:
+    if _quiet():
+        return
+    print(msg)
+
+
+_configure_quiet_startup()
 
 # ── Kaggle paths ─────────────────────────────────────────────────────────────
 INPUT_ROOT = Path("/kaggle/input")
 WORKING = Path("/kaggle/working")
 WORKING.mkdir(parents=True, exist_ok=True)
 
-# import_name -> pip install args (llama_cpp needs package name llama-cpp-python + CUDA wheel)
+# Kaggle ships torch; do not pip-install it (avoids huge re-downloads).
 _PIP_PACKAGES: list[tuple[str, list[str]]] = [
     ("fastapi", ["fastapi"]),
     ("uvicorn", ["uvicorn"]),
     ("transformers", ["transformers"]),
-    ("torch", ["torch"]),
     ("fitz", ["pymupdf"]),
     ("pdfplumber", ["pdfplumber"]),
-    ("cv2", ["opencv-python-headless"]),
 ]
+
+
+def _quiet_pip(*pip_args: str) -> None:
+    env = {**os.environ, "PIP_PROGRESS_BAR": "off", "PIP_DISABLE_PIP_VERSION_CHECK": "1"}
+    result = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "-q", *pip_args],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(f"pip install failed: {detail[:500]}")
 
 
 def _install_llama_cpp() -> None:
     """Install llama-cpp-python with CUDA wheels for Kaggle GPU."""
+    print("Veda: installing llama-cpp-python (CUDA) …")
     cuda_indexes = (
         "https://abetlen.github.io/llama-cpp-python/whl/cu124",
         "https://abetlen.github.io/llama-cpp-python/whl/cu122",
         "https://abetlen.github.io/llama-cpp-python/whl/cu121",
     )
     for index in cuda_indexes:
-        print(f"Installing llama-cpp-python (CUDA wheel from {index}) …")
-        result = subprocess.run(
-            [
-                sys.executable, "-m", "pip", "install", "-q",
-                "llama-cpp-python",
-                "--extra-index-url", index,
-            ],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode == 0:
+        try:
+            _quiet_pip("llama-cpp-python", "--extra-index-url", index)
+            print("Veda: llama-cpp-python ready.")
             return
-        print(result.stderr.strip() or result.stdout.strip())
-    print("CUDA wheels failed — installing CPU-only llama-cpp-python …")
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "llama-cpp-python"])
+        except RuntimeError:
+            continue
+    _quiet_pip("llama-cpp-python")
+    print("Veda: llama-cpp-python ready (CPU wheel).")
 
 
 def _fix_kaggle_pillow_stack() -> None:
-    """Align Pillow + torchvision on Kaggle (avoids _Ink and _imaging version skew).
-
-    Do NOT downgrade Pillow — pdfplumber 0.11+ requires Pillow>=12.2.
-    The original _Ink error is from an outdated torchvision against Pillow 12.
-    """
+    """Only when NLLB fails — pdfplumber needs Pillow>=12.2."""
     if not INPUT_ROOT.exists():
         return
     try:
-        print("Fixing Pillow/torchvision stack for NLLB (force-reinstall Pillow 12 + upgrade torchvision) …")
-        subprocess.check_call(
-            [
-                sys.executable, "-m", "pip", "install", "-q",
-                "--force-reinstall", "pillow>=12.2.0",
-            ],
-        )
-        subprocess.check_call(
-            [sys.executable, "-m", "pip", "install", "-q", "-U", "torchvision"],
-        )
+        _quiet_pip("--force-reinstall", "pillow>=12.2.0")
+        _quiet_pip("-U", "torchvision")
     except Exception as exc:
-        print(f"Pillow/torchvision fix skipped ({exc})")
+        print(f"Veda: Pillow/torchvision fix skipped ({exc})")
 
 
 def _ensure_packages() -> None:
-    _fix_kaggle_pillow_stack()
     for import_name, pip_args in _PIP_PACKAGES:
         try:
             __import__(import_name)
         except ImportError:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", *pip_args])
+            _quiet_pip(*pip_args)
     try:
         __import__("llama_cpp")
     except ImportError:
         _install_llama_cpp()
-
-
-def _setup_upscale_service_path() -> None:
-    """Load upscale_service from working (manual upload) or copy from dataset."""
-    import shutil
-
-    dest = WORKING / "upscale_service.py"
-    if dest.is_file():
-        if str(WORKING) not in sys.path:
-            sys.path.insert(0, str(WORKING))
-        print(f"upscale_service: using {dest}")
-        return
-    for svc in INPUT_ROOT.rglob("upscale_service.py"):
-        shutil.copy2(svc, dest)
-        if str(WORKING) not in sys.path:
-            sys.path.insert(0, str(WORKING))
-        print(f"upscale_service: copied from {svc} → working")
-        return
-    if str(WORKING) not in sys.path:
-        sys.path.insert(0, str(WORKING))
 
 
 _ensure_packages()
@@ -154,9 +152,13 @@ else:
 
 from page_layout_service import PDFMetadataAnalyzer, extract_page_layout  # noqa: E402
 
-_setup_upscale_service_path()
+for qc in INPUT_ROOT.rglob("qwen_config.py"):
+    sys.path.insert(0, str(qc.parent))
+    break
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from upscale_service import upscale_image as run_face_aware_upscale  # noqa: E402
+from qwen_config import get_kaggle_qwen_gguf_info  # noqa: E402
 
 for sec in INPUT_ROOT.rglob("security.py"):
     sys.path.insert(0, str(sec.parent))
@@ -165,11 +167,9 @@ else:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from security import (  # noqa: E402
-    MAX_IMAGE_PIXELS,
     MAX_PDF_BYTES,
     cors_origins,
     require_kaggle_secret,
-    validate_b64_payload,
     validate_pdf_bytes,
 )
 
@@ -217,18 +217,22 @@ def get_llm():
             return _llm
         from llama_cpp import Llama
 
-        gguf = _find_file("qwen2.5-3b-instruct-q4_k_m.gguf")
+        _size, preferred_name, _url = get_kaggle_qwen_gguf_info()
+        gguf = _find_file(preferred_name)
         if gguf is None:
             for pattern in ("qwen*.gguf", "*.gguf"):
-                matches = list(INPUT_ROOT.rglob(pattern))
+                matches = sorted(INPUT_ROOT.rglob(pattern))
                 if matches:
                     gguf = matches[0]
+                    print(f"Veda: preferred {_size} ({preferred_name}) not in dataset; using {gguf.name}")
                     break
         if gguf is None:
-            raise RuntimeError("No Qwen GGUF found in /kaggle/input — add to your dataset.")
+            raise RuntimeError(
+                f"No Qwen GGUF found in /kaggle/input — add {preferred_name} to project-models."
+            )
 
         n_gpu = int(os.environ.get("LLM_GPU_LAYERS", "-1"))
-        print(f"Loading LLM from {gguf} (n_gpu_layers={n_gpu}, main_gpu=0) …")
+        print(f"Veda: loading Qwen {_size} from {gguf.name} (n_gpu_layers={n_gpu}, gpu=0) …")
         _llm = Llama(
             model_path=str(gguf),
             n_ctx=4096,
@@ -236,7 +240,7 @@ def get_llm():
             main_gpu=0,
             verbose=False,
         )
-        print("LLM ready on GPU.")
+        print("Veda: Qwen LLM ready on GPU 0.")
         return _llm
 
 
@@ -267,7 +271,7 @@ def get_nllb():
         import torch
         from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
-        print(f"Loading NLLB ({NLLB_MODEL}) …")
+        print(f"Veda: loading NLLB ({NLLB_MODEL}) …")
         tok = AutoTokenizer.from_pretrained(NLLB_MODEL)
         device_name = NLLB_DEVICE
         if device_name.startswith("cuda") and not torch.cuda.is_available():
@@ -277,17 +281,31 @@ def get_nllb():
             if torch.cuda.device_count() <= idx:
                 device_name = "cuda:0" if torch.cuda.is_available() else "cpu"
 
-        try:
-            if device_name.startswith("cuda"):
+        load_kwargs = {"use_safetensors": True}
+
+        def _load_model(dev: str):
+            if dev.startswith("cuda"):
                 torch.cuda.empty_cache()
-            model = AutoModelForSeq2SeqLM.from_pretrained(NLLB_MODEL)
-            model = model.to(device_name)
-            print(f"NLLB ready on {device_name}.")
-        except Exception as gpu_err:
-            print(f"NLLB load on {device_name} failed ({gpu_err}) — using CPU.")
-            device_name = "cpu"
-            model = AutoModelForSeq2SeqLM.from_pretrained(NLLB_MODEL).to(device_name)
-            print("NLLB ready on CPU.")
+            m = AutoModelForSeq2SeqLM.from_pretrained(NLLB_MODEL, **load_kwargs)
+            return m.to(dev)
+
+        model = None
+        try:
+            model = _load_model(device_name)
+        except Exception as first_err:
+            err_text = str(first_err)
+            if "PIL" in err_text or "_Ink" in err_text:
+                _fix_kaggle_pillow_stack()
+                try:
+                    model = _load_model(device_name)
+                except Exception as retry_err:
+                    first_err = retry_err
+            if model is None:
+                print(f"Veda: NLLB GPU load failed ({first_err}) — trying CPU.")
+                device_name = "cpu"
+                model = _load_model(device_name)
+
+        print(f"Veda: NLLB ready on {device_name}.")
 
         model.eval()
         _nllb_model, _nllb_tokenizer, _nllb_device_name = model, tok, device_name
@@ -325,55 +343,16 @@ def run_nllb_translate(texts: list[str], target_lang: str = "tel_Telu") -> list[
             )
         translated.extend(tokenizer.batch_decode(outputs, skip_special_tokens=True))
 
-    print(f"NLLB translated {len(texts)} strings → {target_lang} on {_nllb_device_name}")
+    _log(f"NLLB translated {len(texts)} strings → {target_lang} on {_nllb_device_name}")
     return translated
 
 
 def _prewarm_nllb() -> None:
     try:
-        run_nllb_translate(["Hello world"], "tel_Telu")
-        print("NLLB pre-warm complete.")
+        get_nllb()
+        print("Veda: NLLB pre-warm complete.")
     except Exception as exc:
-        print(f"NLLB pre-warm failed (will retry on first /translate): {exc}")
-
-
-# ── Real-ESRGAN (GPU 1) ──────────────────────────────────────────────────────
-_esrgan = None
-_esrgan_lock = threading.Lock()
-
-
-def get_esrgan():
-    global _esrgan
-    if _esrgan is not None:
-        return _esrgan
-    with _esrgan_lock:
-        if _esrgan is not None:
-            return _esrgan
-        import torch
-
-        weights = _find_file("RealESRGAN_x4plus.pth")
-        if weights is None:
-            raise RuntimeError("RealESRGAN_x4plus.pth not in dataset")
-
-        rrdb_dir = weights.parent
-        if (rrdb_dir / "rrdb_net.py").exists():
-            sys.path.insert(0, str(rrdb_dir))
-        else:
-            for p in INPUT_ROOT.rglob("rrdb_net.py"):
-                sys.path.insert(0, str(p.parent))
-                break
-
-        from rrdb_net import RRDBNet
-
-        device = torch.device("cuda:1" if torch.cuda.device_count() > 1 else "cuda:0")
-        model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=4)
-        state = torch.load(str(weights), map_location="cpu")
-        w = state.get("params_ema", state.get("params", state))
-        model.load_state_dict(w, strict=True)
-        model.eval().to(device)
-        _esrgan = (model, device)
-        print(f"Real-ESRGAN ready on {device}.")
-        return _esrgan
+        print(f"Veda: NLLB pre-warm failed (will retry on first /translate): {exc}")
 
 
 # ── PDF layout extraction (mirrors laptop server) ────────────────────────────
@@ -386,6 +365,7 @@ PDF_PATH = WORKING / "active_doc.pdf"
 class AnalyzeBody(BaseModel):
     text: str
     is_digest: bool = False
+    page_layout: str = "plain"
 
 
 class TranslateBody(BaseModel):
@@ -412,7 +392,9 @@ def analyze(body: AnalyzeBody, _: None = Depends(verify_token)):
         raise HTTPException(status_code=400, detail="Text is required")
 
     llm = get_llm()
-    messages = build_analyze_messages(text, is_digest=body.is_digest)
+    messages = build_analyze_messages(
+        text, is_digest=body.is_digest, page_layout=body.page_layout
+    )
     with _llm_lock:
         response = llm.create_chat_completion(
             messages=messages,
@@ -493,50 +475,6 @@ def page_layout(page: int, _: None = Depends(verify_token)):
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@app.post("/upscale_image")
-async def upscale_image(request: Request, _: None = Depends(verify_token)):
-    import base64
-
-    from PIL import Image
-
-    payload = await request.json()
-    b64 = payload.get("image", "")
-    fmt = payload.get("format", "png").lower()
-    if not b64:
-        raise HTTPException(status_code=400, detail="Missing image")
-
-    if "," in b64:
-        b64 = b64.split(",", 1)[1]
-    try:
-        validate_b64_payload(b64)
-    except ValueError as exc:
-        raise HTTPException(status_code=413, detail=str(exc)) from exc
-
-    Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
-    img = Image.open(BytesIO(base64.b64decode(b64))).convert("RGB")
-    w, h = img.size
-
-    esrgan_model = None
-    device = None
-    try:
-        esrgan_model, device = get_esrgan()
-    except RuntimeError:
-        pass
-
-    out, method = run_face_aware_upscale(img, esrgan_model=esrgan_model, device=device)
-    print(f"Kaggle /upscale_image: {w}×{h} px → {method}")
-
-    buf = BytesIO()
-    if fmt == "jpeg":
-        out.save(buf, format="JPEG", quality=92)
-        mime = "image/jpeg"
-    else:
-        out.save(buf, format="PNG")
-        mime = "image/png"
-    out_b64 = base64.b64encode(buf.getvalue()).decode()
-    return {"image": f"data:{mime};base64,{out_b64}", "method": method}
-
-
 def _install_cloudflared() -> Path:
     dest = Path("/usr/local/bin/cloudflared")
     if dest.exists():
@@ -544,7 +482,8 @@ def _install_cloudflared() -> Path:
     import urllib.request
 
     url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
-    print("Downloading cloudflared …")
+    if not _quiet():
+        print("Veda: downloading cloudflared …")
     urllib.request.urlretrieve(url, dest)
     dest.chmod(0o755)
     return dest
@@ -562,13 +501,13 @@ def start_tunnel() -> subprocess.Popen:
 
 
 def main():
-    print("KAGGLE_API_SECRET is configured (value hidden). Use the same secret in server/.env on your Veda machine.")
-    print(f"Starting FastAPI on port {PORT} …")
+    print("Veda GPU server starting (quiet mode). Set VEDA_QUIET=0 for verbose logs.")
+    print(f"  port={PORT}  gpus=2 expected  nllb={NLLB_MODEL}")
 
     threading.Thread(target=_prewarm_nllb, daemon=True).start()
 
     server = threading.Thread(
-        target=lambda: uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info"),
+        target=lambda: uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="warning"),
         daemon=True,
     )
     server.start()
@@ -582,7 +521,6 @@ def main():
         if not line:
             time.sleep(0.2)
             continue
-        print(line.rstrip())
         match = re.search(r"(https://[a-z0-9-]+\.trycloudflare\.com)", line)
         if match:
             public_url = match.group(1)
@@ -595,11 +533,11 @@ def main():
         print("  KAGGLE_ENABLED=true")
         print("  LLM_PROVIDER=kaggle")
         print("  TRANSLATE_PROVIDER=kaggle")
-        print("  UPSCALE_PROVIDER=kaggle")
+        print("  LAYOUT_PROVIDER=kaggle")
         print("=" * 60)
-        print("Keep this notebook running while using Veda. Stop session when done.")
+        print("Ready. Keep this notebook running while using Veda.")
     else:
-        print("Tunnel URL not detected — check cloudflared output above.")
+        print("Veda: tunnel URL not detected — set VEDA_QUIET=0 and check cloudflared output.")
 
     try:
         while True:

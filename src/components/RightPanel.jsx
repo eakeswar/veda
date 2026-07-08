@@ -712,7 +712,10 @@ export default function RightPanel({ sidebarOpen, onToggleSidebar }) {
 
             // Trigger background semantic analysis
             console.log(`[Preload] Analysing next page ${nextPage} semantically...`)
-            const semanticData = await fetchSemanticAnalysis(deck.sourceText, deck.title, deck.isDigest)
+            const semanticData = await fetchSemanticAnalysis(deck.sourceText, deck.title, deck.isDigest, 'en-US', {
+              structuredText: deck.analyzeText,
+              pageLayout: deck.pageLayout,
+            })
             if (isCancelled) return
 
             if (semanticData) {
@@ -996,7 +999,11 @@ export default function RightPanel({ sidebarOpen, onToggleSidebar }) {
 
         // Kick off semantic analysis (and Telugu translation) in the background
         setIsAnalyzing(true)
-        fetchSemanticAnalysis(deck.sourceText, deck.title, deck.isDigest, state.language, { onSarvamCreditsExhausted })
+        fetchSemanticAnalysis(deck.sourceText, deck.title, deck.isDigest, state.language, {
+          onSarvamCreditsExhausted,
+          structuredText: deck.analyzeText,
+          pageLayout: deck.pageLayout,
+        })
           .then(async (semanticData) => {
             if (isCancelled) return
 

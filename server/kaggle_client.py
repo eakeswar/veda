@@ -76,7 +76,12 @@ def kaggle_health(timeout: int = 10) -> bool:
         return False
 
 
-def kaggle_analyze(text: str, is_digest: bool = False, timeout: int = DEFAULT_TIMEOUT) -> dict:
+def kaggle_analyze(
+    text: str,
+    is_digest: bool = False,
+    page_layout: str = "plain",
+    timeout: int = DEFAULT_TIMEOUT,
+) -> dict:
     base = kaggle_base_url()
     if not base:
         raise RuntimeError("KAGGLE_API_BASE_URL is not set")
@@ -84,7 +89,7 @@ def kaggle_analyze(text: str, is_digest: bool = False, timeout: int = DEFAULT_TI
     resp = requests.post(
         f"{base}/analyze",
         headers=kaggle_headers(),
-        json={"text": text, "is_digest": is_digest},
+        json={"text": text, "is_digest": is_digest, "page_layout": page_layout},
         timeout=timeout,
     )
     if not resp.ok:
@@ -142,23 +147,6 @@ def kaggle_page_layout(page: int, timeout: int = DEFAULT_TIMEOUT) -> dict:
     if not resp.ok:
         detail = resp.text[:500]
         raise RuntimeError(f"Kaggle /page_layout failed ({resp.status_code}): {detail}")
-    return resp.json()
-
-
-def kaggle_upscale_image(image_b64: str, fmt: str = "png", timeout: int = DEFAULT_TIMEOUT) -> dict:
-    base = kaggle_base_url()
-    if not base:
-        raise RuntimeError("KAGGLE_API_BASE_URL is not set")
-
-    resp = requests.post(
-        f"{base}/upscale_image",
-        headers=kaggle_headers(),
-        json={"image": image_b64, "format": fmt},
-        timeout=timeout,
-    )
-    if not resp.ok:
-        detail = resp.text[:500]
-        raise RuntimeError(f"Kaggle /upscale_image failed ({resp.status_code}): {detail}")
     return resp.json()
 
 
