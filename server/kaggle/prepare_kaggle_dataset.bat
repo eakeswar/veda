@@ -3,6 +3,7 @@ REM Copy model files into a folder you can upload as a Kaggle Dataset named "ved
 set DEST=%~dp0veda-models-bundle
 mkdir "%DEST%" 2>nul
 
+copy /Y "%~dp0..\security.py" "%DEST%\"
 copy /Y "%~dp0..\analyze_prompts.py" "%DEST%\"
 copy /Y "%~dp0..\page_layout_service.py" "%DEST%\"
 copy /Y "%~dp0..\upscale_service.py" "%DEST%\"
@@ -23,5 +24,5 @@ if exist "%~dp0..\models\qwen2.5-3b-instruct-q4_k_m.gguf" (
 
 echo.
 echo Bundle ready: %DEST%
-echo Upload this folder as a Kaggle Dataset named "veda-models"
+echo Upload via publish_kaggle_dataset.bat or manually as Kaggle Dataset "veda-models"
 echo Then attach it to your notebook and run veda_gpu_server.py

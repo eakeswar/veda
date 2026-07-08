@@ -158,7 +158,22 @@ _setup_upscale_service_path()
 
 from upscale_service import upscale_image as run_face_aware_upscale  # noqa: E402
 
-API_SECRET = os.environ.get("KAGGLE_API_SECRET", "veda-kaggle-dev")
+for sec in INPUT_ROOT.rglob("security.py"):
+    sys.path.insert(0, str(sec.parent))
+    break
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from security import (  # noqa: E402
+    MAX_IMAGE_PIXELS,
+    MAX_PDF_BYTES,
+    cors_origins,
+    require_kaggle_secret,
+    validate_b64_payload,
+    validate_pdf_bytes,
+)
+
+API_SECRET = require_kaggle_secret(os.environ.get("KAGGLE_API_SECRET"))
 PORT = int(os.environ.get("VEDA_GPU_PORT", "8766"))
 NLLB_MODEL = os.environ.get("NLLB_MODEL", "facebook/nllb-200-distilled-600M")
 NLLB_DEVICE = os.environ.get("NLLB_DEVICE", "cuda:1")
@@ -167,8 +182,8 @@ TRANSLATE_BATCH_SIZE = int(os.environ.get("TRANSLATE_BATCH_SIZE", "4"))
 app = FastAPI(title="Veda Kaggle GPU Server")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=cors_origins(),
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -176,8 +191,6 @@ _bearer = HTTPBearer(auto_error=False)
 
 
 def verify_token(creds: HTTPAuthorizationCredentials | None = Depends(_bearer)) -> None:
-    if not API_SECRET:
-        return
     if creds is None or creds.credentials != API_SECRET:
         raise HTTPException(status_code=401, detail="Invalid or missing API token")
 
@@ -381,7 +394,7 @@ class TranslateBody(BaseModel):
 
 
 @app.get("/health")
-def health():
+def health(_: None = Depends(verify_token)):
     import torch
 
     return {
@@ -389,7 +402,6 @@ def health():
         "service": "veda-kaggle-gpu",
         "gpus": torch.cuda.device_count() if torch.cuda.is_available() else 0,
         "nllb_loaded": _nllb_model is not None,
-        "nllb_device": _nllb_device_name,
     }
 
 
@@ -432,9 +444,24 @@ def translate(body: TranslateBody, _: None = Depends(verify_token)):
 @app.post("/upload_pdf")
 async def upload_pdf(request: Request, _: None = Depends(verify_token)):
     global _pdf_doc, _pdf_analyzer
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            if int(content_length) > MAX_PDF_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"PDF exceeds maximum size ({MAX_PDF_BYTES // (1024 * 1024)} MB)",
+                )
+        except ValueError:
+            pass
+
     pdf_bytes = await request.body()
     if not pdf_bytes:
         raise HTTPException(status_code=400, detail="Empty file bytes")
+    try:
+        validate_pdf_bytes(pdf_bytes)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     with _pdf_lock:
         if _pdf_doc is not None:
             _pdf_doc.close()
@@ -480,6 +507,12 @@ async def upscale_image(request: Request, _: None = Depends(verify_token)):
 
     if "," in b64:
         b64 = b64.split(",", 1)[1]
+    try:
+        validate_b64_payload(b64)
+    except ValueError as exc:
+        raise HTTPException(status_code=413, detail=str(exc)) from exc
+
+    Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
     img = Image.open(BytesIO(base64.b64decode(b64))).convert("RGB")
     w, h = img.size
 
@@ -529,7 +562,7 @@ def start_tunnel() -> subprocess.Popen:
 
 
 def main():
-    print(f"API secret (set KAGGLE_API_SECRET on Veda server): {API_SECRET}")
+    print("KAGGLE_API_SECRET is configured (value hidden). Use the same secret in server/.env on your Veda machine.")
     print(f"Starting FastAPI on port {PORT} …")
 
     threading.Thread(target=_prewarm_nllb, daemon=True).start()
@@ -558,7 +591,8 @@ def main():
         print("\n" + "=" * 60)
         print("Add to server/.env on your Veda machine:")
         print(f"  KAGGLE_API_BASE_URL={public_url}")
-        print(f"  KAGGLE_API_SECRET={API_SECRET}")
+        print("  KAGGLE_API_SECRET=<same secret you set in this notebook>")
+        print("  KAGGLE_ENABLED=true")
         print("  LLM_PROVIDER=kaggle")
         print("  TRANSLATE_PROVIDER=kaggle")
         print("  UPSCALE_PROVIDER=kaggle")

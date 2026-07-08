@@ -41,6 +41,17 @@ from kaggle_client import (
     should_use_kaggle,
 )
 from page_layout_service import PDFMetadataAnalyzer, extract_page_layout
+from security import (
+    MAX_ANALYZE_TEXT_CHARS,
+    MAX_IMAGE_PIXELS,
+    MAX_PDF_BYTES,
+    MAX_TTS_TEXT_CHARS,
+    cors_origins,
+    redact_kaggle_status,
+    validate_b64_payload,
+    validate_pdf_bytes,
+    validate_text_length,
+)
 from upscale_service import upscale_image as run_face_aware_upscale
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -68,7 +79,7 @@ except ImportError:
 try:
     from fastapi import FastAPI, HTTPException, Request
     from fastapi.middleware.cors import CORSMiddleware
-    from fastapi.responses import StreamingResponse
+    from fastapi.responses import JSONResponse, StreamingResponse
     from pydantic import BaseModel
 except ModuleNotFoundError:
     # Fallback to standard library if pip installation hasn't fully registered in-process yet
@@ -77,14 +88,31 @@ except ModuleNotFoundError:
 
 app = FastAPI(title="TTS & Slide Analysis Server")
 
+VEDA_API_KEY = os.environ.get("VEDA_API_KEY", "").strip()
+
 # Setup CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=cors_origins(),
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def veda_api_key_middleware(request: Request, call_next):
+    """Optional API key auth — active only when VEDA_API_KEY is set in .env."""
+    if not VEDA_API_KEY or request.url.path == "/health" or request.method == "OPTIONS":
+        return await call_next(request)
+
+    auth = request.headers.get("Authorization", "")
+    header_key = request.headers.get("X-Veda-Api-Key", "")
+    token = auth[7:].strip() if auth.startswith("Bearer ") else header_key.strip()
+    if token != VEDA_API_KEY:
+        return JSONResponse(status_code=401, content={"detail": "Invalid or missing API key"})
+    return await call_next(request)
+
 
 VOICE_MAP = {
     "en-US": "en-US-AriaNeural",
@@ -683,13 +711,14 @@ def health_check():
     return {
         "ok": True,
         "service": "veda-tts",
+        "auth_required": bool(VEDA_API_KEY),
         "providers": {
             "llm": resolve_provider("LLM_PROVIDER", "local"),
             "translate": resolve_provider("TRANSLATE_PROVIDER", "local"),
             "layout": resolve_provider("LAYOUT_PROVIDER", "local"),
             "upscale": resolve_provider("UPSCALE_PROVIDER", "local"),
         },
-        "kaggle": ks,
+        "kaggle": redact_kaggle_status(ks),
     }
 
 async def generate_audio_and_boundaries(text: str, voice: str, rate: str) -> tuple[bytes, list[dict]]:
@@ -718,6 +747,10 @@ async def text_to_speech(req: TTSRequest):
 
     if not text:
         raise HTTPException(status_code=400, detail="Text is required")
+    try:
+        validate_text_length(text, MAX_TTS_TEXT_CHARS, "TTS text")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     try:
         sarvam_credits_exhausted = False
@@ -756,6 +789,10 @@ async def text_to_speech_stream(text: str, language: str = "en-US", voice: str =
 
     if not text:
         raise HTTPException(status_code=400, detail="Text is required")
+    try:
+        validate_text_length(text, MAX_TTS_TEXT_CHARS, "TTS text")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     async def audio_generator():
         try:
@@ -791,6 +828,10 @@ async def text_to_speech_boundaries(req: TTSRequest):
 
     if not text:
         raise HTTPException(status_code=400, detail="Text is required")
+    try:
+        validate_text_length(text, MAX_TTS_TEXT_CHARS, "TTS text")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     try:
         word_boundaries = []
@@ -1006,6 +1047,10 @@ def analyze_text(req: AnalyzeRequest):
     text = req.text.strip()
     if not text:
         raise HTTPException(status_code=400, detail="Text is required")
+    try:
+        validate_text_length(text, MAX_ANALYZE_TEXT_CHARS, "Analysis text")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     try:
         mode = "digest" if req.is_digest else "single-topic"
@@ -1075,9 +1120,24 @@ def analyze_text(req: AnalyzeRequest):
 @app.post("/upload_pdf")
 async def upload_pdf(request: Request):
     global active_doc, active_analyzer
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            if int(content_length) > MAX_PDF_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"PDF exceeds maximum size ({MAX_PDF_BYTES // (1024 * 1024)} MB)",
+                )
+        except ValueError:
+            pass
+
     pdf_bytes = await request.body()
     if not pdf_bytes:
         raise HTTPException(status_code=400, detail="Empty file bytes")
+    try:
+        validate_pdf_bytes(pdf_bytes)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     
     with active_doc_lock:
         try:
@@ -1253,6 +1313,12 @@ async def upscale_image(request: Request):
 
     if "," in b64:
         b64 = b64.split(",", 1)[1]
+    try:
+        validate_b64_payload(b64)
+    except ValueError as exc:
+        raise HTTPException(status_code=413, detail=str(exc)) from exc
+
+    Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
     img_bytes = base64.b64decode(b64)
     pil_img = Image.open(BytesIO(img_bytes)).convert("RGB")
 

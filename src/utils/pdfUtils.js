@@ -1,4 +1,5 @@
 import { isSarvamCreditsPayload } from '../lib/sarvamErrors'
+import API, { apiHeaders } from '../config/api'
 
 function isPageNumber(str) {
   const trimmed = str.trim()
@@ -419,8 +420,8 @@ async function getPageText(pdfDoc, pageNumber) {
 
   // 1. Try backend layout parser first
   try {
-    const LAYOUT_URL = `${import.meta.env.VITE_LAYOUT_API_URL || 'http://127.0.0.1:8765'}/page_layout?page=${pageNumber}`
-    const response = await fetch(LAYOUT_URL)
+    const LAYOUT_URL = API.pageLayout(pageNumber)
+    const response = await fetch(LAYOUT_URL, { headers: apiHeaders() })
     if (response.ok) {
       const data = await response.json()
       const rawText = data.lines.map((line) => line.text).join(' ').replace(/\s+/g, ' ').trim()
@@ -731,12 +732,10 @@ export async function fetchSemanticAnalysis(sourceText, fallbackTitle = '', isDi
   }
 
   try {
-    const ANALYZE_URL = import.meta.env.VITE_ANALYZE_API_URL || 'http://127.0.0.1:8765/analyze'
+    const ANALYZE_URL = API.analyze
     const response = await fetch(ANALYZE_URL, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
+      headers: apiHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({ text: sourceText, is_digest: isDigest, language }),
     })
 
@@ -802,10 +801,10 @@ export async function fetchSemanticAnalysis(sourceText, fallbackTitle = '', isDi
 export async function fetchTranslatedFields(deck, fields = ['highlights', 'supportingPoints'], language = 'te-IN') {
   if (!deck) return null
   try {
-    const apiBase = import.meta.env.VITE_LAYOUT_API_URL || 'http://127.0.0.1:8765'
-    const response = await fetch(`${apiBase}/translate_fields`, {
+    const apiBase = API.base
+    const response = await fetch(API.translateFields, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: apiHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({ deck, fields, language }),
     })
     if (!response.ok) return null
@@ -820,10 +819,10 @@ export async function fetchTeluguDeck(deck, options = {}) {
   if (!deck) return null
 
   try {
-    const apiBase = import.meta.env.VITE_LAYOUT_API_URL || 'http://127.0.0.1:8765'
-    const response = await fetch(`${apiBase}/translate_deck`, {
+    const apiBase = API.base
+    const response = await fetch(API.translateDeck, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: apiHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({ deck }),
     })
 
@@ -871,8 +870,8 @@ export async function extractPagePresentation(pdfDoc, pageNumber, fallbackTitle 
 
   // 1. Try backend layout parser
   try {
-    const LAYOUT_URL = `${import.meta.env.VITE_LAYOUT_API_URL || 'http://127.0.0.1:8765'}/page_layout?page=${pageNumber}`
-    const response = await fetch(LAYOUT_URL)
+    const LAYOUT_URL = API.pageLayout(pageNumber)
+    const response = await fetch(LAYOUT_URL, { headers: apiHeaders() })
     if (response.ok) {
       const data = await response.json()
       lines = dedupeLines(data.lines)
@@ -1097,7 +1096,7 @@ function matchImagesToTopicsGlobal(topics, imagesData) {
   return matchedImages
 }
 
-const API_BASE = import.meta.env.VITE_LAYOUT_API_URL || 'http://127.0.0.1:8765'
+const API_BASE = API.base
 
 /**
  * Upscale an array of base64 image data-URLs via Real-ESRGAN on the backend.
@@ -1112,9 +1111,9 @@ export async function upscaleImages(imageUrls) {
       if (!url || !url.startsWith('data:image')) return url
       try {
         const fmt = url.startsWith('data:image/jpeg') ? 'jpeg' : 'png'
-        const resp = await fetch(`${API_BASE}/upscale_image`, {
+        const resp = await fetch(API.upscale, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: apiHeaders({ 'Content-Type': 'application/json' }),
           body: JSON.stringify({ image: url, format: fmt }),
         })
         if (!resp.ok) return url

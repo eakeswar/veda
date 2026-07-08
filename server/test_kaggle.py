@@ -9,7 +9,7 @@ Usage (from repo root):
   # 2) After Kaggle notebook is running, add to server/.env:
   #    KAGGLE_ENABLED=true
   #    KAGGLE_API_BASE_URL=https://xxxx.trycloudflare.com
-  #    KAGGLE_API_SECRET=veda-kaggle-dev
+  #    KAGGLE_API_SECRET=<strong-random-secret>
   #    LLM_PROVIDER=kaggle
   #    TRANSLATE_PROVIDER=local
   #    UPSCALE_PROVIDER=local
@@ -74,7 +74,7 @@ def test_local_health() -> bool:
         data = r.json()
         print(f"  ok={data.get('ok')} providers={data.get('providers')}")
         ks = data.get("kaggle") or {}
-        print(f"  kaggle.enabled={ks.get('enabled')} reachable={ks.get('reachable')} gpus={ks.get('gpus')}")
+        print(f"  kaggle.enabled={ks.get('enabled')} configured={ks.get('configured')} reachable={ks.get('reachable')} gpus={ks.get('gpus')}")
         return r.ok
     except Exception as exc:
         print(f"  FAILED: {exc}")

@@ -16,8 +16,11 @@ def kaggle_base_url() -> str | None:
 def kaggle_headers() -> dict[str, str]:
     headers = {"Content-Type": "application/json"}
     secret = os.environ.get("KAGGLE_API_SECRET", "").strip()
-    if secret:
-        headers["Authorization"] = f"Bearer {secret}"
+    if not secret:
+        if kaggle_enabled():
+            print("WARNING: KAGGLE_ENABLED=true but KAGGLE_API_SECRET is not set")
+        return headers
+    headers["Authorization"] = f"Bearer {secret}"
     return headers
 
 

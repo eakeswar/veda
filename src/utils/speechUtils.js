@@ -1,6 +1,7 @@
 import { isSarvamCreditsPayload } from '../lib/sarvamErrors'
+import API, { apiHeaders } from '../config/api'
 
-const CUSTOM_TTS_URL = import.meta.env.VITE_TTS_API_URL || 'http://127.0.0.1:8765/tts'
+const CUSTOM_TTS_URL = API.tts
 
 function maybeNotifySarvamCredits(data, status, onSarvamCreditsExhausted) {
   if (onSarvamCreditsExhausted && isSarvamCreditsPayload(data, status)) {
@@ -45,9 +46,7 @@ export async function requestCloudTTS({ text, language, rate = '+0%', voice = ''
 
   const response = await fetch(CUSTOM_TTS_URL, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
+    headers: apiHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({ text, language, rate, voice }),
   })
 
@@ -87,9 +86,7 @@ export async function requestCloudTTSBoundaries({ text, language, rate = '+0%', 
 
   const response = await fetch(`${apiBase}/tts_boundaries`, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
+    headers: apiHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({ text, language, rate, voice }),
   })
 

@@ -2,6 +2,7 @@ import { useState } from "react"
 import { usePDF } from "../context/PDFContext"
 import { extractTOC } from "../utils/pdfUtils"
 import { cn } from "../lib/cn"
+import API, { apiHeaders } from "../config/api"
 
 function getActiveItem(toc, selectedPage) {
   if (!toc || toc.length === 0) return null
@@ -32,10 +33,10 @@ export default function LeftPanel({ isOpen, onToggle }) {
       ).toString()
       const arrayBuffer = await file.arrayBuffer()
       try {
-        const UPLOAD_URL = import.meta.env.VITE_UPLOAD_API_URL || 'http://127.0.0.1:8765/upload_pdf'
+        const UPLOAD_URL = API.upload
         await fetch(UPLOAD_URL, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/pdf' },
+          headers: apiHeaders({ 'Content-Type': 'application/pdf' }),
           body: arrayBuffer,
         })
         console.log('PDF successfully uploaded to backend for layout analysis.')
