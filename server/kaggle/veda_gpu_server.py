@@ -105,12 +105,18 @@ def _install_llama_cpp() -> None:
 
 
 def _fix_kaggle_pillow_stack() -> None:
-    """Only when NLLB fails — pdfplumber needs Pillow>=12.2."""
+    """Align Pillow 12.x + torchvision; keep transformers 4.x with huggingface_hub 0.x."""
     if not INPUT_ROOT.exists():
         return
     try:
-        _quiet_pip("--force-reinstall", "pillow>=12.2.0")
-        _quiet_pip("-U", "torchvision")
+        print("Veda: aligning Pillow / torchvision / transformers stack for Kaggle …")
+        _quiet_pip(
+            "--force-reinstall",
+            "pillow>=12.2.0",
+            "torchvision",
+            "transformers>=4.46,<5",
+            "huggingface_hub>=0.34,<1.0",
+        )
     except Exception as exc:
         print(f"Veda: Pillow/torchvision fix skipped ({exc})")
 
@@ -160,6 +166,14 @@ else:
 
 from qwen_config import get_kaggle_qwen_gguf_info  # noqa: E402
 
+for ig in INPUT_ROOT.rglob("image_gen_service.py"):
+    sys.path.insert(0, str(ig.parent))
+    break
+else:
+    sys.path.insert(0, str(WORKING))
+
+from image_gen_service import get_vram_stats, log_vram_snapshot, run_layer1  # noqa: E402
+
 for sec in INPUT_ROOT.rglob("security.py"):
     sys.path.insert(0, str(sec.parent))
     break
@@ -167,9 +181,12 @@ else:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from security import (  # noqa: E402
+    MAX_IMAGE_B64_CHARS,
+    MAX_IMAGE_PIXELS,
     MAX_PDF_BYTES,
     cors_origins,
     require_kaggle_secret,
+    validate_b64_payload,
     validate_pdf_bytes,
 )
 
@@ -373,6 +390,11 @@ class TranslateBody(BaseModel):
     target_lang: str = "tel_Telu"
 
 
+class GeneratePromptBody(BaseModel):
+    image: str
+    page_text: str = ""
+
+
 @app.get("/health")
 def health(_: None = Depends(verify_token)):
     import torch
@@ -382,6 +404,9 @@ def health(_: None = Depends(verify_token)):
         "service": "veda-kaggle-gpu",
         "gpus": torch.cuda.device_count() if torch.cuda.is_available() else 0,
         "nllb_loaded": _nllb_model is not None,
+        "llm_loaded": _llm is not None,
+        "image_gen_layer": 1,
+        "vram": get_vram_stats(),
     }
 
 
@@ -420,6 +445,56 @@ def translate(body: TranslateBody, _: None = Depends(verify_token)):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         print(f"Kaggle /translate failed: {exc}")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/generate_prompt")
+def generate_prompt(body: GeneratePromptBody, _: None = Depends(verify_token)):
+    """
+    Layer 1 trial — SmolVLM caption + Qwen 7B SDXL prompt refinement.
+    Does not generate an image yet (Layer 2 SDXL comes later).
+    """
+    from PIL import Image
+
+    b64 = body.image.strip()
+    if not b64:
+        raise HTTPException(status_code=400, detail="image is required")
+
+    if "," in b64:
+        b64 = b64.split(",", 1)[1]
+    try:
+        validate_b64_payload(b64, max_chars=MAX_IMAGE_B64_CHARS)
+    except ValueError as exc:
+        raise HTTPException(status_code=413, detail=str(exc)) from exc
+
+    Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
+    try:
+        pil_img = Image.open(BytesIO(__import__("base64").b64decode(b64))).convert("RGB")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid image data: {exc}") from exc
+
+    page_text = (body.page_text or "").strip()
+    print(
+        f"Kaggle /generate_prompt: input {pil_img.width}×{pil_img.height} px, "
+        f"page_text={len(page_text)} chars"
+    )
+
+    try:
+        llm = get_llm()
+        result = run_layer1(pil_img, page_text, llm, _llm_lock)
+        return result
+    except Exception as exc:
+        err_text = str(exc)
+        if "PIL" in err_text or "_Ink" in err_text:
+            print(f"Kaggle /generate_prompt: Pillow stack error ({exc}) — retrying after fix …")
+            _fix_kaggle_pillow_stack()
+            try:
+                llm = get_llm()
+                result = run_layer1(pil_img, page_text, llm, _llm_lock)
+                return result
+            except Exception as retry_err:
+                exc = retry_err
+        print(f"Kaggle /generate_prompt failed: {exc}")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
@@ -503,6 +578,9 @@ def start_tunnel() -> subprocess.Popen:
 def main():
     print("Veda GPU server starting (quiet mode). Set VEDA_QUIET=0 for verbose logs.")
     print(f"  port={PORT}  gpus=2 expected  nllb={NLLB_MODEL}")
+    if INPUT_ROOT.exists():
+        _fix_kaggle_pillow_stack()
+    log_vram_snapshot("startup")
 
     threading.Thread(target=_prewarm_nllb, daemon=True).start()
 

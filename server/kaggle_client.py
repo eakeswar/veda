@@ -150,5 +150,33 @@ def kaggle_page_layout(page: int, timeout: int = DEFAULT_TIMEOUT) -> dict:
     return resp.json()
 
 
+def kaggle_generate_prompt(
+    image_b64: str,
+    page_text: str = "",
+    timeout: int | None = None,
+) -> dict:
+    """Layer 1 trial — SmolVLM caption + Qwen SDXL prompt via Kaggle GPU."""
+    base = kaggle_base_url()
+    if not base:
+        raise RuntimeError("KAGGLE_API_BASE_URL is not set")
+
+    req_timeout = int(os.environ.get("KAGGLE_IMAGE_GEN_TIMEOUT", "180"))
+    effective_timeout = timeout if timeout is not None else req_timeout
+
+    resp = requests.post(
+        f"{base}/generate_prompt",
+        headers=kaggle_headers(),
+        json={"image": image_b64, "page_text": page_text},
+        timeout=effective_timeout,
+    )
+    if not resp.ok:
+        detail = resp.text[:500]
+        raise RuntimeError(f"Kaggle /generate_prompt failed ({resp.status_code}): {detail}")
+    data = resp.json()
+    if not isinstance(data.get("prompt"), str) or not data["prompt"].strip():
+        raise RuntimeError("Kaggle /generate_prompt returned invalid payload")
+    return data
+
+
 def resolve_provider(env_name: str, default: str = "local") -> str:
     return os.environ.get(env_name, default).strip().lower()

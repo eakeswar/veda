@@ -127,13 +127,54 @@ def timed_analyze_kaggle_direct() -> float | None:
         return None
 
 
+# Minimal 64×64 red PNG for Layer 1 prompt trial (no file needed)
+_TRIAL_IMAGE_B64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAgElEQVR4nNXOQREAIAzAsFI1yEE2shCxB9coyLpnUyZxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEidxEufvwNQDkpgBwN0XZkgAAAAASUVORK5CYII="
+)
+
+
+def test_kaggle_generate_prompt() -> bool:
+    from kaggle_client import kaggle_generate_prompt, kaggle_status
+
+    ks = kaggle_status()
+    print("\nKaggle GPU Layer 1 /generate_prompt …")
+    print(f"  status={ks}")
+    if not ks.get("reachable"):
+        print("  Skipped — Kaggle tunnel not reachable (start notebook, update KAGGLE_API_BASE_URL)")
+        return False
+
+    t0 = time.perf_counter()
+    try:
+        data = kaggle_generate_prompt(
+            _TRIAL_IMAGE_B64,
+            page_text=SAMPLE_TEXT,
+        )
+        elapsed = time.perf_counter() - t0
+        print(f"  OK in {elapsed:.1f}s — method={data.get('method')!r}")
+        print(f"  caption: {data.get('caption', '')[:160]}")
+        print(f"  prompt:  {data.get('prompt', '')[:160]}")
+        return True
+    except Exception as exc:
+        print(f"  FAILED: {exc}")
+        return False
+
+
 def main():
     parser = argparse.ArgumentParser(description="Test Veda Kaggle GPU integration from laptop")
     parser.add_argument("--compare", action="store_true", help="Run local then Kaggle and show timings")
     parser.add_argument("--kaggle-only", action="store_true", help="Only test direct Kaggle GPU server")
+    parser.add_argument(
+        "--prompt-trial",
+        action="store_true",
+        help="Test Layer 1 /generate_prompt (SmolVLM + Qwen) on Kaggle",
+    )
     args = parser.parse_args()
 
     _print_env()
+
+    if args.prompt_trial:
+        ok = test_kaggle_generate_prompt()
+        sys.exit(0 if ok else 1)
 
     if args.kaggle_only:
         timed_analyze_kaggle_direct()
@@ -157,6 +198,7 @@ def main():
 
     print("\nTip: run with --compare after Kaggle notebook is up to benchmark local vs GPU.")
     print("Tip: run with --kaggle-only to test the tunnel without the local server.")
+    print("Tip: run with --prompt-trial to test Layer 1 image prompt generation on Kaggle.")
 
 
 if __name__ == "__main__":

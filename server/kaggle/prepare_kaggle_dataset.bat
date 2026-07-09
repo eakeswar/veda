@@ -13,6 +13,7 @@ copy /Y "%~dp0..\qwen_config.py" "%DEST%\"
 copy /Y "%~dp0..\analyze_prompts.py" "%DEST%\"
 copy /Y "%~dp0..\page_layout_service.py" "%DEST%\"
 copy /Y "%~dp0veda_gpu_server.py" "%DEST%\"
+copy /Y "%~dp0image_gen_service.py" "%DEST%\"
 
 if exist "%MODELS%\qwen2.5-7b-instruct-q3_k_m.gguf" (
   copy /Y "%MODELS%\qwen2.5-7b-instruct-q3_k_m.gguf" "%DEST%\"
