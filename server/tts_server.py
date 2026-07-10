@@ -30,8 +30,10 @@ except ImportError:
 import requests
 
 from analyze_prompts import build_analyze_messages, extract_analysis_json
+from decorative_image import is_decorative_image
 from kaggle_client import (
     kaggle_analyze,
+    kaggle_generate_image,
     kaggle_page_layout,
     kaggle_status,
     kaggle_translate,
@@ -685,6 +687,7 @@ def health_check():
             "translate": resolve_provider("TRANSLATE_PROVIDER", "local"),
             "layout": resolve_provider("LAYOUT_PROVIDER", "local"),
             "upscale": resolve_provider("UPSCALE_PROVIDER", "local"),
+            "image_gen": resolve_provider("IMAGE_GEN_PROVIDER", "auto"),
         },
         "kaggle": redact_kaggle_status(ks),
     }
@@ -1260,13 +1263,26 @@ async def transcribe_audio(req: TranscribeRequest):
 @app.post("/upscale_image")
 async def upscale_image(request: Request):
     """
-    Upscale a base64-encoded image using face-aware Lanczos (no AI model).
+    Upscale or regenerate a base64-encoded image.
+
+    Decorative images (covers, illustrations) route to Kaggle SDXL when
+    IMAGE_GEN_PROVIDER allows and Kaggle is reachable; otherwise Lanczos.
+    Informational images (charts, screenshots) always use Lanczos.
 
     Request body (JSON):
-        { "image": "<base64 PNG or JPEG>", "format": "png" | "jpeg" }
+        {
+          "image": "<base64 or data-URL>",
+          "format": "png" | "jpeg",
+          "page_text": "...",
+          "page_width": 612,
+          "page_height": 792,
+          "page_word_count": 120,
+          "is_image_primary": false,
+          "image_meta": { "x", "y", "w", "h", "overlapWordCount", "url" }
+        }
 
     Response (JSON):
-        { "image": "<base64 upscaled image>", "method": "lanczos_people_x4" | "lanczos_x2" | ... }
+        { "image": "<data-URL>", "method": "sdxl" | "lanczos_x2" | ... }
     """
     try:
         from PIL import Image
@@ -1274,11 +1290,19 @@ async def upscale_image(request: Request):
         raise HTTPException(status_code=503, detail=f"Pillow not installed: {exc}") from exc
 
     body = await request.json()
-    b64 = body.get("image", "")
+    image_field = body.get("image", "")
     fmt = body.get("format", "png").lower()
-    if not b64:
+    page_text = (body.get("page_text") or "").strip()
+    page_width = body.get("page_width")
+    page_height = body.get("page_height")
+    page_word_count = int(body.get("page_word_count") or 0)
+    is_image_primary = bool(body.get("is_image_primary"))
+    image_meta = body.get("image_meta") or {}
+
+    if not image_field:
         raise HTTPException(status_code=400, detail="Missing 'image' field in request body.")
 
+    b64 = image_field
     if "," in b64:
         b64 = b64.split(",", 1)[1]
     try:
@@ -1291,7 +1315,42 @@ async def upscale_image(request: Request):
     pil_img = Image.open(BytesIO(img_bytes)).convert("RGB")
 
     w, h = pil_img.width, pil_img.height
-    print(f"/upscale_image: input {w}×{h} px (Lanczos), fmt={fmt}")
+    decorative = False
+    if image_meta and page_width and page_height:
+        try:
+            decorative = is_decorative_image(
+                image_meta,
+                page_width=float(page_width),
+                page_height=float(page_height),
+                page_word_count=page_word_count,
+                is_image_primary=is_image_primary,
+            )
+        except Exception as meta_err:
+            print(f"/upscale_image: decorative check failed ({meta_err}) — Lanczos")
+
+    image_gen_provider = resolve_provider("IMAGE_GEN_PROVIDER", "auto")
+    if decorative and should_use_kaggle(image_gen_provider):
+        print(f"/upscale_image: decorative → Kaggle SDXL ({w}×{h} px)")
+        loop = asyncio.get_event_loop()
+        try:
+            gen_result = await loop.run_in_executor(
+                None,
+                lambda: kaggle_generate_image(image_field, page_text=page_text),
+            )
+            out_url = gen_result.get("image", "")
+            if out_url:
+                method = gen_result.get("method", "sdxl")
+                print(f"/upscale_image: SDXL output [{method}]")
+                return {
+                    "image": out_url,
+                    "method": method,
+                    "prompt": gen_result.get("prompt"),
+                    "caption": gen_result.get("caption"),
+                }
+        except Exception as gen_err:
+            print(f"/upscale_image: Kaggle generate failed ({gen_err}) — Lanczos fallback")
+
+    print(f"/upscale_image: input {w}×{h} px (Lanczos), fmt={fmt}, decorative={decorative}")
 
     loop = asyncio.get_event_loop()
     out_pil, method = await loop.run_in_executor(None, lambda: run_face_aware_upscale(pil_img))

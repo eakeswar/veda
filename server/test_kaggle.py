@@ -159,6 +159,66 @@ def test_kaggle_generate_prompt() -> bool:
         return False
 
 
+def test_kaggle_translate() -> bool:
+    from kaggle_client import kaggle_status, kaggle_translate
+
+    ks = kaggle_status()
+    print("\nKaggle GPU /translate (NLLB) …")
+    print(f"  status={ks}")
+    if not ks.get("reachable"):
+        print("  Skipped — Kaggle tunnel not reachable")
+        return False
+
+    sample = ["Photosynthesis converts sunlight into chemical energy in plants."]
+    t0 = time.perf_counter()
+    try:
+        translated = kaggle_translate(sample, target_lang="tel_Telu")
+        elapsed = time.perf_counter() - t0
+        if not translated or not translated[0].strip():
+            print("  FAILED: empty translation")
+            return False
+        print(f"  OK in {elapsed:.1f}s")
+        print(f"  en: {sample[0][:80]}")
+        te = translated[0][:120]
+        try:
+            print(f"  te: {te}")
+        except UnicodeEncodeError:
+            print(f"  te: {te.encode('ascii', 'backslashreplace').decode('ascii')}")
+        return True
+    except Exception as exc:
+        print(f"  FAILED: {exc}")
+        return False
+
+
+def test_kaggle_generate_image() -> bool:
+    from kaggle_client import kaggle_generate_image, kaggle_status
+
+    ks = kaggle_status()
+    print("\nKaggle GPU Layer 2 /generate_image …")
+    print(f"  status={ks}")
+    if not ks.get("reachable"):
+        print("  Skipped — Kaggle tunnel not reachable (start notebook, update KAGGLE_API_BASE_URL)")
+        return False
+
+    t0 = time.perf_counter()
+    try:
+        data = kaggle_generate_image(
+            _TRIAL_IMAGE_B64,
+            page_text=SAMPLE_TEXT,
+        )
+        elapsed = time.perf_counter() - t0
+        image_url = data.get("image", "")
+        print(f"  OK in {elapsed:.1f}s — method={data.get('method')!r}")
+        print(f"  size: {data.get('width')}×{data.get('height')} px")
+        print(f"  caption: {data.get('caption', '')[:120]}")
+        print(f"  prompt:  {data.get('prompt', '')[:120]}")
+        print(f"  image:   {len(image_url)} chars data-URL")
+        return True
+    except Exception as exc:
+        print(f"  FAILED: {exc}")
+        return False
+
+
 def main():
     parser = argparse.ArgumentParser(description="Test Veda Kaggle GPU integration from laptop")
     parser.add_argument("--compare", action="store_true", help="Run local then Kaggle and show timings")
@@ -168,9 +228,27 @@ def main():
         action="store_true",
         help="Test Layer 1 /generate_prompt (SmolVLM + Qwen) on Kaggle",
     )
+    parser.add_argument(
+        "--generate-trial",
+        action="store_true",
+        help="Test Layer 2 /generate_image (SmolVLM + Qwen + SDXL) on Kaggle",
+    )
+    parser.add_argument(
+        "--translate-trial",
+        action="store_true",
+        help="Test NLLB /translate on Kaggle (confirms cuda:1 pre-warm)",
+    )
     args = parser.parse_args()
 
     _print_env()
+
+    if args.translate_trial:
+        ok = test_kaggle_translate()
+        sys.exit(0 if ok else 1)
+
+    if args.generate_trial:
+        ok = test_kaggle_generate_image()
+        sys.exit(0 if ok else 1)
 
     if args.prompt_trial:
         ok = test_kaggle_generate_prompt()
@@ -199,6 +277,7 @@ def main():
     print("\nTip: run with --compare after Kaggle notebook is up to benchmark local vs GPU.")
     print("Tip: run with --kaggle-only to test the tunnel without the local server.")
     print("Tip: run with --prompt-trial to test Layer 1 image prompt generation on Kaggle.")
+    print("Tip: run with --translate-trial to verify NLLB translation on Kaggle.")
 
 
 if __name__ == "__main__":

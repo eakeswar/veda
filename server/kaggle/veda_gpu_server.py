@@ -66,23 +66,32 @@ WORKING.mkdir(parents=True, exist_ok=True)
 _PIP_PACKAGES: list[tuple[str, list[str]]] = [
     ("fastapi", ["fastapi"]),
     ("uvicorn", ["uvicorn"]),
-    ("transformers", ["transformers"]),
+    ("transformers", ["transformers>=4.46.2,<4.49", "huggingface_hub>=0.34,<1.0"]),
     ("fitz", ["pymupdf"]),
     ("pdfplumber", ["pdfplumber"]),
 ]
 
 
-def _quiet_pip(*pip_args: str) -> None:
+def _run_pip(*pip_args: str) -> None:
     env = {**os.environ, "PIP_PROGRESS_BAR": "off", "PIP_DISABLE_PIP_VERSION_CHECK": "1"}
     result = subprocess.run(
-        [sys.executable, "-m", "pip", "install", "-q", *pip_args],
+        [sys.executable, "-m", "pip", *pip_args],
         capture_output=True,
         text=True,
         env=env,
     )
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()
-        raise RuntimeError(f"pip install failed: {detail[:500]}")
+        cmd = " ".join(pip_args[:3])
+        raise RuntimeError(f"pip {cmd} failed: {detail[:500]}")
+
+
+def _quiet_pip(*pip_args: str) -> None:
+    _run_pip("install", "-q", *pip_args)
+
+
+def _quiet_pip_uninstall(*packages: str) -> None:
+    _run_pip("uninstall", "-y", *packages)
 
 
 def _install_llama_cpp() -> None:
@@ -110,13 +119,27 @@ def _fix_kaggle_pillow_stack() -> None:
         return
     try:
         print("Veda: aligning Pillow / torchvision / transformers stack for Kaggle …")
+        # Clean broken mixed installs (e.g. huggingface_hub 1.x with transformers 4.x).
+        _quiet_pip_uninstall("transformers", "huggingface_hub", "tokenizers")
         _quiet_pip(
             "--force-reinstall",
             "pillow>=12.2.0",
             "torchvision",
-            "transformers>=4.46,<5",
+            "transformers>=4.46.2,<4.49",
             "huggingface_hub>=0.34,<1.0",
+            "tokenizers>=0.20,<1",
         )
+        stale = [
+            name for name in list(sys.modules)
+            if name == "transformers"
+            or name.startswith("transformers.")
+            or name == "huggingface_hub"
+            or name.startswith("huggingface_hub.")
+            or name == "tokenizers"
+            or name.startswith("tokenizers.")
+        ]
+        for name in stale:
+            sys.modules.pop(name, None)
     except Exception as exc:
         print(f"Veda: Pillow/torchvision fix skipped ({exc})")
 
@@ -132,6 +155,24 @@ def _ensure_packages() -> None:
     except ImportError:
         _install_llama_cpp()
 
+
+def _ensure_image_gen_packages() -> None:
+    """Runtime install for SDXL (Kaggle only — not in server/vendor/)."""
+    if not INPUT_ROOT.exists():
+        return
+    for import_name, pip_args in (
+        ("diffusers", ["diffusers", "accelerate", "safetensors"]),
+    ):
+        try:
+            __import__(import_name)
+        except ImportError:
+            print(f"Veda: installing {import_name} for SDXL …")
+            _quiet_pip(*pip_args)
+
+
+if INPUT_ROOT.exists():
+    _fix_kaggle_pillow_stack()
+    _ensure_image_gen_packages()
 
 _ensure_packages()
 
@@ -172,7 +213,7 @@ for ig in INPUT_ROOT.rglob("image_gen_service.py"):
 else:
     sys.path.insert(0, str(WORKING))
 
-from image_gen_service import get_vram_stats, log_vram_snapshot, run_layer1  # noqa: E402
+from image_gen_service import get_vram_stats, log_vram_snapshot, run_full_pipeline, run_layer1  # noqa: E402
 
 for sec in INPUT_ROOT.rglob("security.py"):
     sys.path.insert(0, str(sec.parent))
@@ -278,6 +319,20 @@ def _nllb_target_lang_id(tokenizer, target_lang: str) -> int:
     raise ValueError(f"Unknown target language code: {target_lang}")
 
 
+def _assert_nllb_materialized(model) -> None:
+    """Raise if any parameter is still a meta tensor (broken load)."""
+    import torch
+
+    for param in model.parameters():
+        if getattr(param, "is_meta", False):
+            raise RuntimeError("NLLB weights still on meta device after load")
+        if param.device.type == "meta":
+            raise RuntimeError("NLLB weights on meta device after load")
+        # Touch real storage — fails fast on meta tensors.
+        _ = param.data_ptr() if param.numel() else 0
+        break
+
+
 def get_nllb():
     global _nllb_model, _nllb_tokenizer, _nllb_device_name
     if _nllb_model is not None:
@@ -298,13 +353,25 @@ def get_nllb():
             if torch.cuda.device_count() <= idx:
                 device_name = "cuda:0" if torch.cuda.is_available() else "cpu"
 
-        load_kwargs = {"use_safetensors": True}
+        load_kwargs: dict = {
+            "use_safetensors": True,
+            "low_cpu_mem_usage": False,
+            "device_map": None,
+        }
 
         def _load_model(dev: str):
             if dev.startswith("cuda"):
                 torch.cuda.empty_cache()
-            m = AutoModelForSeq2SeqLM.from_pretrained(NLLB_MODEL, **load_kwargs)
-            return m.to(dev)
+            dtype = torch.float16 if dev.startswith("cuda") else torch.float32
+            model = AutoModelForSeq2SeqLM.from_pretrained(
+                NLLB_MODEL,
+                torch_dtype=dtype,
+                **load_kwargs,
+            )
+            if dev.startswith("cuda"):
+                model = model.to(dev)
+            _assert_nllb_materialized(model)
+            return model
 
         model = None
         try:
@@ -317,6 +384,10 @@ def get_nllb():
                     model = _load_model(device_name)
                 except Exception as retry_err:
                     first_err = retry_err
+            elif "meta" in err_text.lower():
+                print(f"Veda: NLLB meta-tensor load on {device_name} ({first_err}) — retrying CPU …")
+                device_name = "cpu"
+                model = _load_model(device_name)
             if model is None:
                 print(f"Veda: NLLB GPU load failed ({first_err}) — trying CPU.")
                 device_name = "cpu"
@@ -395,6 +466,50 @@ class GeneratePromptBody(BaseModel):
     page_text: str = ""
 
 
+class GenerateImageBody(BaseModel):
+    image: str
+    page_text: str = ""
+
+
+def _decode_request_image(image_field: str):
+    """Decode base64 / data-URL image from API body → PIL RGB."""
+    import base64
+
+    from PIL import Image
+
+    b64 = (image_field or "").strip()
+    if not b64:
+        raise HTTPException(status_code=400, detail="image is required")
+
+    if "," in b64:
+        b64 = b64.split(",", 1)[1]
+    try:
+        validate_b64_payload(b64, max_chars=MAX_IMAGE_B64_CHARS)
+    except ValueError as exc:
+        raise HTTPException(status_code=413, detail=str(exc)) from exc
+
+    Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
+    try:
+        return Image.open(BytesIO(base64.b64decode(b64))).convert("RGB")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid image data: {exc}") from exc
+
+
+def _run_image_gen(handler, pil_img, page_text: str):
+    """Run an image-gen handler with Pillow-stack retry."""
+    try:
+        llm = get_llm()
+        return handler(pil_img, page_text, llm, _llm_lock)
+    except Exception as exc:
+        err_text = str(exc)
+        if "PIL" in err_text or "_Ink" in err_text:
+            print(f"Veda image-gen: Pillow stack error ({exc}) — retrying after fix …")
+            _fix_kaggle_pillow_stack()
+            llm = get_llm()
+            return handler(pil_img, page_text, llm, _llm_lock)
+        raise
+
+
 @app.get("/health")
 def health(_: None = Depends(verify_token)):
     import torch
@@ -405,7 +520,7 @@ def health(_: None = Depends(verify_token)):
         "gpus": torch.cuda.device_count() if torch.cuda.is_available() else 0,
         "nllb_loaded": _nllb_model is not None,
         "llm_loaded": _llm is not None,
-        "image_gen_layer": 1,
+        "image_gen_layer": 2,
         "vram": get_vram_stats(),
     }
 
@@ -451,28 +566,9 @@ def translate(body: TranslateBody, _: None = Depends(verify_token)):
 @app.post("/generate_prompt")
 def generate_prompt(body: GeneratePromptBody, _: None = Depends(verify_token)):
     """
-    Layer 1 trial — SmolVLM caption + Qwen 7B SDXL prompt refinement.
-    Does not generate an image yet (Layer 2 SDXL comes later).
+    Layer 1 — SmolVLM caption + Qwen 7B SDXL prompt refinement (no image output).
     """
-    from PIL import Image
-
-    b64 = body.image.strip()
-    if not b64:
-        raise HTTPException(status_code=400, detail="image is required")
-
-    if "," in b64:
-        b64 = b64.split(",", 1)[1]
-    try:
-        validate_b64_payload(b64, max_chars=MAX_IMAGE_B64_CHARS)
-    except ValueError as exc:
-        raise HTTPException(status_code=413, detail=str(exc)) from exc
-
-    Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
-    try:
-        pil_img = Image.open(BytesIO(__import__("base64").b64decode(b64))).convert("RGB")
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Invalid image data: {exc}") from exc
-
+    pil_img = _decode_request_image(body.image)
     page_text = (body.page_text or "").strip()
     print(
         f"Kaggle /generate_prompt: input {pil_img.width}×{pil_img.height} px, "
@@ -480,21 +576,37 @@ def generate_prompt(body: GeneratePromptBody, _: None = Depends(verify_token)):
     )
 
     try:
-        llm = get_llm()
-        result = run_layer1(pil_img, page_text, llm, _llm_lock)
-        return result
+        return _run_image_gen(run_layer1, pil_img, page_text)
+    except HTTPException:
+        raise
     except Exception as exc:
-        err_text = str(exc)
-        if "PIL" in err_text or "_Ink" in err_text:
-            print(f"Kaggle /generate_prompt: Pillow stack error ({exc}) — retrying after fix …")
-            _fix_kaggle_pillow_stack()
-            try:
-                llm = get_llm()
-                result = run_layer1(pil_img, page_text, llm, _llm_lock)
-                return result
-            except Exception as retry_err:
-                exc = retry_err
         print(f"Kaggle /generate_prompt failed: {exc}")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/generate_image")
+def generate_image(body: GenerateImageBody, _: None = Depends(verify_token)):
+    """
+    Layer 1 + 2 — SmolVLM caption → Qwen prompt → SDXL PNG.
+    """
+    pil_img = _decode_request_image(body.image)
+    page_text = (body.page_text or "").strip()
+    print(
+        f"Kaggle /generate_image: input {pil_img.width}×{pil_img.height} px, "
+        f"page_text={len(page_text)} chars"
+    )
+
+    try:
+        result = _run_image_gen(run_full_pipeline, pil_img, page_text)
+        print(
+            f"Kaggle /generate_image: output {result.get('width')}×{result.get('height')} px "
+            f"[{result.get('method')}]"
+        )
+        return result
+    except HTTPException:
+        raise
+    except Exception as exc:
+        print(f"Kaggle /generate_image failed: {exc}")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
@@ -578,8 +690,6 @@ def start_tunnel() -> subprocess.Popen:
 def main():
     print("Veda GPU server starting (quiet mode). Set VEDA_QUIET=0 for verbose logs.")
     print(f"  port={PORT}  gpus=2 expected  nllb={NLLB_MODEL}")
-    if INPUT_ROOT.exists():
-        _fix_kaggle_pillow_stack()
     log_vram_snapshot("startup")
 
     threading.Thread(target=_prewarm_nllb, daemon=True).start()

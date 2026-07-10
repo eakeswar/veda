@@ -116,6 +116,58 @@ def _extract_lines_pymupdf(page_obj, width, height, active_analyzer):
     return lines
 
 
+def _words_overlapping_image_count(words, ix0, iy0, ix1, iy1) -> int:
+    """Count pdfplumber words overlapping an image rect (>45% word width)."""
+    count = 0
+    for w in words:
+        wx0, wy0, wx1, wy1 = w["x0"], w["top"], w["x1"], w["bottom"]
+        ox = min(wx1, ix1) - max(wx0, ix0)
+        oy = min(wy1, iy1) - max(wy0, iy0)
+        if ox > 0 and oy > 0:
+            word_w = wx1 - wx0 or 1
+            if ox / word_w > 0.45:
+                count += 1
+    return count
+
+
+def _attach_overlap_word_counts(
+    images: list[dict],
+    pdf_path: str,
+    page_num: int,
+    page_height: float,
+    pdfplumber_available: bool,
+) -> None:
+    """Set overlapWordCount on each image dict (words overlapping image zone)."""
+    for img in images:
+        img["overlapWordCount"] = 0
+
+    if not images or not pdfplumber_available or not _PDFPLUMBER_IMPORTED:
+        return
+
+    try:
+        with _pdfplumber.open(pdf_path) as pdf:
+            pl_page = pdf.pages[page_num - 1]
+            try:
+                words = pl_page.extract_words(
+                    keep_blank_chars=False,
+                    x_tolerance=3,
+                    y_tolerance=3,
+                )
+            except Exception:
+                words = pl_page.extract_words(keep_blank_chars=False, x_tolerance=3, y_tolerance=3)
+
+        for img in images:
+            td = (
+                img["x"],
+                page_height - img["y"] - img["h"],
+                img["x"] + img["w"],
+                page_height - img["y"],
+            )
+            img["overlapWordCount"] = _words_overlapping_image_count(words, *td)
+    except Exception as exc:
+        print(f"overlapWordCount skipped for page {page_num} ({exc})")
+
+
 def _content_image_rects(img_rects_topdown, width, height):
     """Image rects that should suppress overlapping text (exclude full-page backgrounds)."""
     page_area = width * height or 1
@@ -373,6 +425,14 @@ def extract_page_layout(
                 "cy": height - (rect.y0 + rect.y1) / 2
             })
             break  # one rect per xref is enough for position info
+
+    _attach_overlap_word_counts(
+        images,
+        str(active_doc.name),
+        page,
+        height,
+        pdfplumber_available,
+    )
 
     # ── Text extraction ───────────────────────────────────────────────
     # pdfplumber gives column-aware, image-zone-filtered text.

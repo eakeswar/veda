@@ -1,16 +1,32 @@
-"""Kaggle-only Layer 1 image prompt pipeline: SmolVLM caption → Qwen 7B SDXL prompt."""
+"""Kaggle-only image generation: Layer 1 SmolVLM+Qwen prompt, Layer 2 SDXL."""
 from __future__ import annotations
 
+import base64
 import os
 import re
 import threading
+from io import BytesIO
 from typing import Any
 
 SMOLVLM_MODEL = os.environ.get("SMOLVLM_MODEL", "HuggingFaceTB/SmolVLM-500M-Instruct")
 SMOLVLM_DEVICE = os.environ.get("SMOLVLM_DEVICE", "cuda:0")
+SDXL_MODEL = os.environ.get("SDXL_MODEL", "stabilityai/stable-diffusion-xl-base-1.0")
+SDXL_DEVICE = os.environ.get("SDXL_DEVICE", "cuda:1")
+SDXL_STEPS = int(os.environ.get("SDXL_STEPS", "25"))
+SDXL_GUIDANCE = float(os.environ.get("SDXL_GUIDANCE", "7.0"))
+SDXL_MIN_SIDE = int(os.environ.get("SDXL_MIN_SIDE", "512"))
+SDXL_MAX_SIDE = int(os.environ.get("SDXL_MAX_SIDE", "1024"))
+SDXL_VRAM_1024_MB = int(os.environ.get("SDXL_VRAM_1024_MB", "12000"))
+SDXL_VRAM_768_MB = int(os.environ.get("SDXL_VRAM_768_MB", "9000"))
+
 CAPTION_MAX_TOKENS = int(os.environ.get("SMOLVLM_CAPTION_MAX_TOKENS", "128"))
 PROMPT_MAX_TOKENS = int(os.environ.get("IMAGE_PROMPT_MAX_TOKENS", "220"))
 PAGE_TEXT_MAX_CHARS = int(os.environ.get("IMAGE_GEN_PAGE_TEXT_MAX_CHARS", "1500"))
+
+NEGATIVE_PROMPT = (
+    "text, watermark, logo, words, letters, caption, signature, writing, label, "
+    "blurry, low quality, distorted, deformed, ugly, bad anatomy"
+)
 
 CAPTION_USER_TEXT = (
     "Describe this educational magazine illustration in 2-4 sentences. "
@@ -30,6 +46,9 @@ PROMPT_SYSTEM = (
 _smolvlm_processor = None
 _smolvlm_model = None
 _smolvlm_lock = threading.Lock()
+
+_sdxl_pipe = None
+_sdxl_lock = threading.Lock()
 
 
 def get_vram_stats() -> dict[str, Any]:
@@ -184,4 +203,180 @@ def run_layer1(pil_img, page_text: str, llm, llm_lock) -> dict[str, str]:
         "caption": caption,
         "prompt": prompt,
         "method": "layer1_smolvlm_qwen",
+    }
+
+
+def _free_vram_mb(device: str) -> int | None:
+    try:
+        import torch
+    except ImportError:
+        return None
+    if not torch.cuda.is_available():
+        return None
+    idx = int(device.split(":")[1]) if ":" in device else 0
+    free_b, _total_b = torch.cuda.mem_get_info(idx)
+    return int(free_b / (1024 * 1024))
+
+
+def _max_output_side(device: str = SDXL_DEVICE) -> int:
+    """Pick SDXL max side from free VRAM on the generation GPU (NLLB shares cuda:1)."""
+    free_mb = _free_vram_mb(device)
+    if free_mb is None:
+        return min(SDXL_MAX_SIDE, 768)
+    if free_mb >= SDXL_VRAM_1024_MB:
+        return SDXL_MAX_SIDE
+    if free_mb >= SDXL_VRAM_768_MB:
+        return 768
+    return SDXL_MIN_SIDE
+
+
+def _round_to_multiple(value: int, multiple: int = 8) -> int:
+    return max(multiple, int(round(value / multiple) * multiple))
+
+
+def compute_output_size(src_w: int, src_h: int, max_side: int | None = None) -> tuple[int, int]:
+    """Clamp output to 512–1024px, preserve aspect ratio, multiples of 8."""
+    if src_w < 1 or src_h < 1:
+        side = max_side or SDXL_MIN_SIDE
+        return side, side
+
+    cap = max_side or _max_output_side()
+    cap = max(SDXL_MIN_SIDE, min(SDXL_MAX_SIDE, cap))
+    scale = cap / max(src_w, src_h)
+    out_w = _round_to_multiple(src_w * scale)
+    out_h = _round_to_multiple(src_h * scale)
+
+    longest = max(out_w, out_h)
+    if longest < SDXL_MIN_SIDE:
+        boost = SDXL_MIN_SIDE / longest
+        out_w = _round_to_multiple(out_w * boost)
+        out_h = _round_to_multiple(out_h * boost)
+
+    longest = max(out_w, out_h)
+    if longest > SDXL_MAX_SIDE:
+        shrink = SDXL_MAX_SIDE / longest
+        out_w = _round_to_multiple(out_w * shrink)
+        out_h = _round_to_multiple(out_h * shrink)
+
+    return out_w, out_h
+
+
+def _load_sdxl_pipeline():
+    global _sdxl_pipe
+    if _sdxl_pipe is not None:
+        return _sdxl_pipe
+
+    import torch
+    from diffusers import StableDiffusionXLPipeline
+
+    print(f"Veda image-gen: loading SDXL ({SDXL_MODEL}) on {SDXL_DEVICE} …")
+    log_vram_snapshot("before_sdxl_load")
+
+    dtype = torch.float16 if SDXL_DEVICE.startswith("cuda") else torch.float32
+    pipe = StableDiffusionXLPipeline.from_pretrained(
+        SDXL_MODEL,
+        torch_dtype=dtype,
+        use_safetensors=True,
+        variant="fp16" if dtype == torch.float16 else None,
+    )
+    pipe = pipe.to(SDXL_DEVICE)
+    pipe.enable_attention_slicing()
+    if hasattr(pipe, "enable_vae_slicing"):
+        pipe.enable_vae_slicing()
+    pipe.set_progress_bar_config(disable=True)
+
+    _sdxl_pipe = pipe
+    log_vram_snapshot("after_sdxl_load")
+    print("Veda image-gen: SDXL ready.")
+    return _sdxl_pipe
+
+
+def get_sdxl_pipeline():
+    if _sdxl_pipe is not None:
+        return _sdxl_pipe
+    with _sdxl_lock:
+        if _sdxl_pipe is not None:
+            return _sdxl_pipe
+        return _load_sdxl_pipeline()
+
+
+def generate_image_sdxl(prompt: str, src_w: int, src_h: int):
+    """Layer 2 — SDXL generation from a refined text prompt."""
+    import torch
+
+    out_w, out_h = compute_output_size(src_w, src_h)
+    print(f"Veda image-gen: SDXL {out_w}×{out_h} px, steps={SDXL_STEPS}")
+
+    pipe = get_sdxl_pipeline()
+    generator = None
+    if SDXL_DEVICE.startswith("cuda"):
+        device_idx = int(SDXL_DEVICE.split(":")[1]) if ":" in SDXL_DEVICE else 0
+        generator = torch.Generator(device=f"cuda:{device_idx}").manual_seed(42)
+
+    with _sdxl_lock:
+        with torch.inference_mode():
+            result = pipe(
+                prompt=prompt,
+                negative_prompt=NEGATIVE_PROMPT,
+                width=out_w,
+                height=out_h,
+                num_inference_steps=SDXL_STEPS,
+                guidance_scale=SDXL_GUIDANCE,
+                generator=generator,
+            )
+
+    image = result.images[0].convert("RGB")
+    log_vram_snapshot("layer2_done")
+    return image, out_w, out_h
+
+
+def pil_to_data_url(pil_img, fmt: str = "png") -> str:
+    buf = BytesIO()
+    if fmt == "jpeg":
+        pil_img.save(buf, format="JPEG", quality=92)
+        mime = "image/jpeg"
+    else:
+        pil_img.save(buf, format="PNG")
+        mime = "image/png"
+    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    return f"data:{mime};base64,{b64}"
+
+
+def run_layer2(prompt: str, src_w: int, src_h: int) -> dict[str, Any]:
+    """Layer 2 only — SDXL image from prompt."""
+    log_vram_snapshot("layer2_start")
+    try:
+        image, out_w, out_h = generate_image_sdxl(prompt, src_w, src_h)
+    except Exception as exc:
+        err_lower = str(exc).lower()
+        if "out of memory" in err_lower or "cuda" in err_lower:
+            print(f"Veda image-gen: SDXL OOM ({exc}) — retrying at {SDXL_MIN_SIDE}px …")
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except ImportError:
+                pass
+            image, out_w, out_h = generate_image_sdxl(prompt, SDXL_MIN_SIDE, SDXL_MIN_SIDE)
+        else:
+            raise
+    return {
+        "image": pil_to_data_url(image),
+        "width": out_w,
+        "height": out_h,
+        "method": "sdxl",
+    }
+
+
+def run_full_pipeline(pil_img, page_text: str, llm, llm_lock) -> dict[str, Any]:
+    """Layer 1 + Layer 2: caption → prompt → SDXL PNG."""
+    layer1 = run_layer1(pil_img, page_text, llm, llm_lock)
+    layer2 = run_layer2(layer1["prompt"], pil_img.width, pil_img.height)
+    return {
+        "caption": layer1["caption"],
+        "prompt": layer1["prompt"],
+        "image": layer2["image"],
+        "width": layer2["width"],
+        "height": layer2["height"],
+        "method": "layer2_smolvlm_qwen_sdxl",
     }

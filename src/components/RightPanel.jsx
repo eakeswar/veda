@@ -975,7 +975,18 @@ export default function RightPanel({ sidebarOpen, onToggleSidebar }) {
           const toUpscale = [...new Set(rawImages.filter(Boolean))]
             .filter((u) => !upscaledUrlMapRef.current[u])   // skip already-upscaled
           if (toUpscale.length === 0) return
-          upscaleImages(toUpscale)
+          const pageWordCount = (targetDeck.sourceText || '')
+            .trim()
+            .split(/\s+/)
+            .filter(Boolean).length
+          upscaleImages(toUpscale, {
+            pageText: targetDeck.sourceText || '',
+            pageWidth: targetDeck.pageWidth || 0,
+            pageHeight: targetDeck.pageHeight || 0,
+            pageWordCount,
+            isImagePrimary: !!targetDeck.isImagePrimary,
+            imagesMeta: targetDeck.imagesMeta || [],
+          })
             .then((upscaled) => {
               if (isCancelled) return
               const urlMap = Object.fromEntries(toUpscale.map((u, i) => [u, upscaled[i]]))

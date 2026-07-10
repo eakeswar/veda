@@ -1055,6 +1055,8 @@ export async function extractPagePresentation(pdfDoc, pageNumber, fallbackTitle 
   let sourceText = ''
   let analyzeText = ''
   let pageLayout = 'plain'
+  let pageWidth = 0
+  let pageHeight = 0
   let fetchedBackend = false
 
   // 1. Try backend layout parser
@@ -1070,7 +1072,9 @@ export async function extractPagePresentation(pdfDoc, pageNumber, fallbackTitle 
         isCallout: detectCalloutPage(lines),
       })
       pageLayout = detectCalloutPage(lines) ? 'qa' : 'structured'
-      imagesData = data.images
+      pageWidth = data.width || 0
+      pageHeight = data.height || 0
+      imagesData = data.images || []
       images = data.images.map((img) => img.url)
       fetchedBackend = true
     }
@@ -1126,6 +1130,9 @@ export async function extractPagePresentation(pdfDoc, pageNumber, fallbackTitle 
       supportingPoints: [],
       sourceText,
       images,
+      imagesMeta: imagesData,
+      pageWidth,
+      pageHeight,
       narration: title ? `This section features ${title}.` : 'Image-focused content.',
     }
   }
@@ -1161,6 +1168,9 @@ export async function extractPagePresentation(pdfDoc, pageNumber, fallbackTitle 
       analyzeText: buildStructuredAnalyzeText(lines),
       pageLayout: 'structured',
       images: matchedImages,
+      imagesMeta: imagesData,
+      pageWidth,
+      pageHeight,
       narration: intro ? `${intro} ${buildDigestNarration(topics)}`.replace(/\s+/g, ' ').trim() : buildDigestNarration(topics),
     }
   }
@@ -1201,6 +1211,9 @@ export async function extractPagePresentation(pdfDoc, pageNumber, fallbackTitle 
     analyzeText,
     pageLayout,
     images,
+    imagesMeta: imagesData,
+    pageWidth,
+    pageHeight,
     narration: buildNarration(title, summary),
   }
 }
@@ -1312,12 +1325,25 @@ function matchImagesToTopicsGlobal(topics, imagesData) {
 const API_BASE = API.base
 
 /**
- * Upscale an array of base64 image data-URLs via face-aware Lanczos on the backend.
- * Requests run concurrently. Any image that fails falls back to its original.
- * Returns a new array of the same length with upscaled (or original) data-URLs.
+ * Upscale or regenerate images via the backend.
+ * Decorative images may route to Kaggle SDXL; informational images use Lanczos.
+ * Any failure falls back to the original URL.
  */
-export async function upscaleImages(imageUrls) {
+export async function upscaleImages(imageUrls, context = {}) {
   if (!imageUrls || imageUrls.length === 0) return imageUrls
+
+  const {
+    pageText = '',
+    pageWidth = 0,
+    pageHeight = 0,
+    pageWordCount = 0,
+    isImagePrimary = false,
+    imagesMeta = [],
+  } = context
+
+  const metaByUrl = Object.fromEntries(
+    (imagesMeta || []).filter((m) => m && m.url).map((m) => [m.url, m])
+  )
 
   const results = await Promise.all(
     imageUrls.map(async (url) => {
@@ -1327,7 +1353,16 @@ export async function upscaleImages(imageUrls) {
         const resp = await fetch(API.upscale, {
           method: 'POST',
           headers: apiHeaders({ 'Content-Type': 'application/json' }),
-          body: JSON.stringify({ image: url, format: fmt }),
+          body: JSON.stringify({
+            image: url,
+            format: fmt,
+            page_text: pageText,
+            page_width: pageWidth,
+            page_height: pageHeight,
+            page_word_count: pageWordCount,
+            is_image_primary: isImagePrimary,
+            image_meta: metaByUrl[url] || null,
+          }),
         })
         if (!resp.ok) return url
         const data = await resp.json()
