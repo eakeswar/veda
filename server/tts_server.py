@@ -30,7 +30,7 @@ except ImportError:
 import requests
 
 from analyze_prompts import build_analyze_messages, extract_analysis_json
-from decorative_image import is_decorative_image
+from decorative_image import is_decorative_image, is_tiny_image
 from kaggle_client import (
     kaggle_analyze,
     kaggle_generate_image,
@@ -1265,9 +1265,9 @@ async def upscale_image(request: Request):
     """
     Upscale or regenerate a base64-encoded image.
 
-    Decorative images (covers, illustrations) route to Kaggle SDXL when
-    IMAGE_GEN_PROVIDER allows and Kaggle is reachable; otherwise Lanczos.
-    Informational images (charts, screenshots) always use Lanczos.
+    Decorative tiny images (either dim < 400px) route to Kaggle SDXL img2img when
+    IMAGE_GEN_PROVIDER allows and Kaggle is reachable; larger decorative and all
+    informational images use Lanczos.
 
     Request body (JSON):
         {
@@ -1329,8 +1329,15 @@ async def upscale_image(request: Request):
             print(f"/upscale_image: decorative check failed ({meta_err}) — Lanczos")
 
     image_gen_provider = resolve_provider("IMAGE_GEN_PROVIDER", "auto")
-    if decorative and should_use_kaggle(image_gen_provider):
-        print(f"/upscale_image: decorative → Kaggle SDXL ({w}×{h} px)")
+    use_kaggle_gen = (
+        decorative
+        and is_tiny_image(w, h)
+        and should_use_kaggle(image_gen_provider)
+    )
+    if decorative and not is_tiny_image(w, h):
+        print(f"/upscale_image: decorative but not tiny ({w}×{h} px) → Lanczos")
+    if use_kaggle_gen:
+        print(f"/upscale_image: decorative tiny → Kaggle SDXL img2img ({w}×{h} px)")
         loop = asyncio.get_event_loop()
         try:
             gen_result = await loop.run_in_executor(
@@ -1339,8 +1346,8 @@ async def upscale_image(request: Request):
             )
             out_url = gen_result.get("image", "")
             if out_url:
-                method = gen_result.get("method", "sdxl")
-                print(f"/upscale_image: SDXL output [{method}]")
+                method = gen_result.get("method", "sdxl_img2img")
+                print(f"/upscale_image: SDXL img2img output [{method}]")
                 return {
                     "image": out_url,
                     "method": method,

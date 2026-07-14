@@ -1,4 +1,4 @@
-"""Kaggle-only image generation: Layer 1 SmolVLM+Qwen prompt, Layer 2 SDXL."""
+"""Kaggle-only image generation: Layer 1 SmolVLM+Qwen prompt, Layer 2 SDXL img2img."""
 from __future__ import annotations
 
 import base64
@@ -12,8 +12,9 @@ SMOLVLM_MODEL = os.environ.get("SMOLVLM_MODEL", "HuggingFaceTB/SmolVLM-500M-Inst
 SMOLVLM_DEVICE = os.environ.get("SMOLVLM_DEVICE", "cuda:0")
 SDXL_MODEL = os.environ.get("SDXL_MODEL", "stabilityai/stable-diffusion-xl-base-1.0")
 SDXL_DEVICE = os.environ.get("SDXL_DEVICE", "cuda:1")
-SDXL_STEPS = int(os.environ.get("SDXL_STEPS", "25"))
-SDXL_GUIDANCE = float(os.environ.get("SDXL_GUIDANCE", "7.0"))
+SDXL_STEPS = int(os.environ.get("SDXL_STEPS", "20"))
+SDXL_GUIDANCE = float(os.environ.get("SDXL_GUIDANCE", "6.0"))
+SDXL_STRENGTH = float(os.environ.get("SDXL_STRENGTH", "0.35"))
 SDXL_MIN_SIDE = int(os.environ.get("SDXL_MIN_SIDE", "512"))
 SDXL_MAX_SIDE = int(os.environ.get("SDXL_MAX_SIDE", "1024"))
 SDXL_VRAM_1024_MB = int(os.environ.get("SDXL_VRAM_1024_MB", "12000"))
@@ -25,7 +26,8 @@ PAGE_TEXT_MAX_CHARS = int(os.environ.get("IMAGE_GEN_PAGE_TEXT_MAX_CHARS", "1500"
 
 NEGATIVE_PROMPT = (
     "text, watermark, logo, words, letters, caption, signature, writing, label, "
-    "blurry, low quality, distorted, deformed, ugly, bad anatomy"
+    "blurry, low quality, distorted, deformed, ugly, bad anatomy, different subject, "
+    "changed composition, new scene"
 )
 
 CAPTION_USER_TEXT = (
@@ -35,11 +37,14 @@ CAPTION_USER_TEXT = (
 )
 
 PROMPT_SYSTEM = (
-    "You write concise Stable Diffusion XL prompts for educational magazine illustrations.\n"
+    "You write concise Stable Diffusion XL img2img prompts for enhancing educational "
+    "magazine illustrations.\n"
     "Given an image caption and page context, output ONE paragraph prompt (40-80 words) "
-    "describing a high-quality illustration to generate.\n"
-    "Include style cues: photorealistic or illustrated, lighting, composition, and subject.\n"
-    "Do NOT include readable text, watermarks, logos, captions, or words in the scene.\n"
+    "that preserves the original subjects, layout, colors, and composition while "
+    "improving clarity, sharpness, and detail.\n"
+    "Use phrases like: same scene, same subjects, faithful enhancement, preserve layout.\n"
+    "Do NOT invent new subjects, change the scene, or add readable text, watermarks, "
+    "logos, captions, or words.\n"
     "Output ONLY the prompt text — no explanation, no JSON, no markdown."
 )
 
@@ -86,6 +91,11 @@ def log_vram_snapshot(label: str) -> None:
     print(f"VRAM [{label}]: " + ", ".join(parts))
 
 
+def _hf_hub_kwargs() -> dict:
+    token = (os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or "").strip()
+    return {"token": token} if token else {}
+
+
 def _load_smolvlm():
     global _smolvlm_processor, _smolvlm_model
     if _smolvlm_model is not None:
@@ -94,15 +104,21 @@ def _load_smolvlm():
     import torch
     from transformers import AutoModelForVision2Seq, AutoProcessor
 
+    hf_kw = _hf_hub_kwargs()
     print(f"Veda image-gen: loading SmolVLM ({SMOLVLM_MODEL}) on {SMOLVLM_DEVICE} …")
     log_vram_snapshot("before_smolvlm_load")
 
-    processor = AutoProcessor.from_pretrained(SMOLVLM_MODEL)
+    print("Veda image-gen: downloading SmolVLM processor …")
+    processor = AutoProcessor.from_pretrained(SMOLVLM_MODEL, **hf_kw)
     dtype = torch.float16 if SMOLVLM_DEVICE.startswith("cuda") else torch.float32
+    print("Veda image-gen: downloading SmolVLM weights …")
     model = AutoModelForVision2Seq.from_pretrained(
         SMOLVLM_MODEL,
         torch_dtype=dtype,
-    ).to(SMOLVLM_DEVICE)
+        **hf_kw,
+    )
+    print(f"Veda image-gen: moving SmolVLM to {SMOLVLM_DEVICE} …")
+    model = model.to(SMOLVLM_DEVICE)
     model.eval()
 
     _smolvlm_processor = processor
@@ -267,18 +283,22 @@ def _load_sdxl_pipeline():
         return _sdxl_pipe
 
     import torch
-    from diffusers import StableDiffusionXLPipeline
+    from diffusers import StableDiffusionXLImg2ImgPipeline
 
-    print(f"Veda image-gen: loading SDXL ({SDXL_MODEL}) on {SDXL_DEVICE} …")
+    hf_kw = _hf_hub_kwargs()
+    print(f"Veda image-gen: loading SDXL img2img ({SDXL_MODEL}) on {SDXL_DEVICE} …")
     log_vram_snapshot("before_sdxl_load")
 
     dtype = torch.float16 if SDXL_DEVICE.startswith("cuda") else torch.float32
-    pipe = StableDiffusionXLPipeline.from_pretrained(
+    print("Veda image-gen: downloading SDXL weights (this is the largest download, ~6 GB) …")
+    pipe = StableDiffusionXLImg2ImgPipeline.from_pretrained(
         SDXL_MODEL,
         torch_dtype=dtype,
         use_safetensors=True,
         variant="fp16" if dtype == torch.float16 else None,
+        **hf_kw,
     )
+    print(f"Veda image-gen: moving SDXL to {SDXL_DEVICE} …")
     pipe = pipe.to(SDXL_DEVICE)
     pipe.enable_attention_slicing()
     if hasattr(pipe, "enable_vae_slicing"):
@@ -287,7 +307,7 @@ def _load_sdxl_pipeline():
 
     _sdxl_pipe = pipe
     log_vram_snapshot("after_sdxl_load")
-    print("Veda image-gen: SDXL ready.")
+    print("Veda image-gen: SDXL img2img ready.")
     return _sdxl_pipe
 
 
@@ -300,12 +320,25 @@ def get_sdxl_pipeline():
         return _load_sdxl_pipeline()
 
 
-def generate_image_sdxl(prompt: str, src_w: int, src_h: int):
-    """Layer 2 — SDXL generation from a refined text prompt."""
+def _prepare_init_image(pil_img, out_w: int, out_h: int):
+    """Resize source image to SDXL output dimensions for img2img."""
+    if pil_img.width == out_w and pil_img.height == out_h:
+        return pil_img.convert("RGB")
+    return pil_img.convert("RGB").resize((out_w, out_h), resample=1)  # LANCZOS
+
+
+def generate_image_sdxl(prompt: str, pil_img, src_w: int, src_h: int, strength: float | None = None):
+    """Layer 2 — SDXL img2img enhancement from original pixels + refined prompt."""
     import torch
 
     out_w, out_h = compute_output_size(src_w, src_h)
-    print(f"Veda image-gen: SDXL {out_w}×{out_h} px, steps={SDXL_STEPS}")
+    denoise = SDXL_STRENGTH if strength is None else strength
+    denoise = max(0.05, min(0.95, denoise))
+    init_image = _prepare_init_image(pil_img, out_w, out_h)
+    print(
+        f"Veda image-gen: SDXL img2img {out_w}×{out_h} px, "
+        f"steps={SDXL_STEPS}, strength={denoise:.2f}"
+    )
 
     pipe = get_sdxl_pipeline()
     generator = None
@@ -317,9 +350,9 @@ def generate_image_sdxl(prompt: str, src_w: int, src_h: int):
         with torch.inference_mode():
             result = pipe(
                 prompt=prompt,
+                image=init_image,
                 negative_prompt=NEGATIVE_PROMPT,
-                width=out_w,
-                height=out_h,
+                strength=denoise,
                 num_inference_steps=SDXL_STEPS,
                 guidance_scale=SDXL_GUIDANCE,
                 generator=generator,
@@ -342,11 +375,11 @@ def pil_to_data_url(pil_img, fmt: str = "png") -> str:
     return f"data:{mime};base64,{b64}"
 
 
-def run_layer2(prompt: str, src_w: int, src_h: int) -> dict[str, Any]:
-    """Layer 2 only — SDXL image from prompt."""
+def run_layer2(prompt: str, pil_img, src_w: int, src_h: int) -> dict[str, Any]:
+    """Layer 2 only — SDXL img2img from original image + prompt."""
     log_vram_snapshot("layer2_start")
     try:
-        image, out_w, out_h = generate_image_sdxl(prompt, src_w, src_h)
+        image, out_w, out_h = generate_image_sdxl(prompt, pil_img, src_w, src_h)
     except Exception as exc:
         err_lower = str(exc).lower()
         if "out of memory" in err_lower or "cuda" in err_lower:
@@ -357,26 +390,27 @@ def run_layer2(prompt: str, src_w: int, src_h: int) -> dict[str, Any]:
                     torch.cuda.empty_cache()
             except ImportError:
                 pass
-            image, out_w, out_h = generate_image_sdxl(prompt, SDXL_MIN_SIDE, SDXL_MIN_SIDE)
+            small = pil_img.resize((SDXL_MIN_SIDE, SDXL_MIN_SIDE), resample=1)
+            image, out_w, out_h = generate_image_sdxl(prompt, small, SDXL_MIN_SIDE, SDXL_MIN_SIDE)
         else:
             raise
     return {
         "image": pil_to_data_url(image),
         "width": out_w,
         "height": out_h,
-        "method": "sdxl",
+        "method": "sdxl_img2img",
     }
 
 
 def run_full_pipeline(pil_img, page_text: str, llm, llm_lock) -> dict[str, Any]:
-    """Layer 1 + Layer 2: caption → prompt → SDXL PNG."""
+    """Layer 1 + Layer 2: caption → prompt → SDXL img2img PNG."""
     layer1 = run_layer1(pil_img, page_text, llm, llm_lock)
-    layer2 = run_layer2(layer1["prompt"], pil_img.width, pil_img.height)
+    layer2 = run_layer2(layer1["prompt"], pil_img, pil_img.width, pil_img.height)
     return {
         "caption": layer1["caption"],
         "prompt": layer1["prompt"],
         "image": layer2["image"],
         "width": layer2["width"],
         "height": layer2["height"],
-        "method": "layer2_smolvlm_qwen_sdxl",
+        "method": "layer2_smolvlm_qwen_sdxl_img2img",
     }

@@ -213,7 +213,14 @@ for ig in INPUT_ROOT.rglob("image_gen_service.py"):
 else:
     sys.path.insert(0, str(WORKING))
 
-from image_gen_service import get_vram_stats, log_vram_snapshot, run_full_pipeline, run_layer1  # noqa: E402
+from image_gen_service import (  # noqa: E402
+    get_sdxl_pipeline,
+    get_smolvlm,
+    get_vram_stats,
+    log_vram_snapshot,
+    run_full_pipeline,
+    run_layer1,
+)
 
 for sec in INPUT_ROOT.rglob("security.py"):
     sys.path.insert(0, str(sec.parent))
@@ -344,7 +351,9 @@ def get_nllb():
         from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
         print(f"Veda: loading NLLB ({NLLB_MODEL}) …")
-        tok = AutoTokenizer.from_pretrained(NLLB_MODEL)
+        hf_kw = _hf_hub_kwargs()
+        print("Veda: downloading NLLB tokenizer …")
+        tok = AutoTokenizer.from_pretrained(NLLB_MODEL, **hf_kw)
         device_name = NLLB_DEVICE
         if device_name.startswith("cuda") and not torch.cuda.is_available():
             device_name = "cpu"
@@ -363,10 +372,12 @@ def get_nllb():
             if dev.startswith("cuda"):
                 torch.cuda.empty_cache()
             dtype = torch.float16 if dev.startswith("cuda") else torch.float32
+            print("Veda: downloading NLLB weights …")
             model = AutoModelForSeq2SeqLM.from_pretrained(
                 NLLB_MODEL,
                 torch_dtype=dtype,
                 **load_kwargs,
+                **hf_kw,
             )
             if dev.startswith("cuda"):
                 model = model.to(dev)
@@ -435,12 +446,99 @@ def run_nllb_translate(texts: list[str], target_lang: str = "tel_Telu") -> list[
     return translated
 
 
-def _prewarm_nllb() -> None:
+
+_image_gen_ready = False
+_image_gen_prewarm_lock = threading.Lock()
+_prewarm_in_progress = False
+_prewarm_step = "not_started"
+
+
+def _configure_hf_token() -> bool:
+    """Use HF_TOKEN / HUGGING_FACE_HUB_TOKEN for faster, rate-limit-free downloads."""
+    token = (os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or "").strip()
+    if not token:
+        print("Veda: no HF_TOKEN set — HuggingFace downloads may be slow or rate-limited.")
+        return False
+    os.environ["HF_TOKEN"] = token
+    os.environ["HUGGING_FACE_HUB_TOKEN"] = token
+    print("Veda: HF_TOKEN configured for model downloads.")
+    return True
+
+
+def _set_prewarm_step(step: str) -> None:
+    global _prewarm_step
+    _prewarm_step = step
+    print(f"Veda pre-warm [{step}] …")
+
+
+def _hf_hub_kwargs() -> dict:
+    token = (os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or "").strip()
+    return {"token": token} if token else {}
+
+
+def _prewarm_all_models() -> None:
+    """Sequential pre-warm: NLLB → Qwen → SmolVLM → SDXL (one HF download at a time)."""
+    global _image_gen_ready, _prewarm_in_progress
+    if os.environ.get("IMAGE_GEN_PREWARM", "1").strip().lower() in ("0", "false", "no"):
+        print("Veda: model pre-warm disabled (IMAGE_GEN_PREWARM=0).")
+        return
+
+    _prewarm_in_progress = True
     try:
+        _configure_hf_token()
+        log_vram_snapshot("prewarm_start")
+
+        _set_prewarm_step("1/4 NLLB")
         get_nllb()
         print("Veda: NLLB pre-warm complete.")
+        log_vram_snapshot("after_nllb")
+
+        _set_prewarm_step("2/4 Qwen")
+        get_llm()
+        print("Veda: Qwen pre-warm complete.")
+        log_vram_snapshot("after_qwen")
+
+        _set_prewarm_step("3/4 SmolVLM")
+        _ensure_image_gen_packages()
+        get_smolvlm()
+        print("Veda: SmolVLM pre-warm complete.")
+        log_vram_snapshot("after_smolvlm")
+
+        _set_prewarm_step("4/4 SDXL img2img")
+        get_sdxl_pipeline()
+        print("Veda: SDXL img2img pre-warm complete.")
+        log_vram_snapshot("after_sdxl")
+
+        with _image_gen_prewarm_lock:
+            _image_gen_ready = True
+        _prewarm_step = "complete"
+        print("Veda: all model pre-warm complete — image-gen tunnel requests should respond in <100s.")
     except Exception as exc:
-        print(f"Veda: NLLB pre-warm failed (will retry on first /translate): {exc}")
+        _prewarm_step = f"failed: {exc}"
+        print(f"Veda: model pre-warm failed (image-gen will retry on first request): {exc}")
+    finally:
+        _prewarm_in_progress = False
+
+
+def _require_image_gen_ready() -> None:
+    """Reject tunnel requests while models are still downloading (avoids Cloudflare 524)."""
+    if _image_gen_ready:
+        return
+    if _prewarm_in_progress:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"Image-gen models still loading ({_prewarm_step}). "
+                "Wait for 'all model pre-warm complete' in notebook logs."
+            ),
+        )
+    raise HTTPException(
+        status_code=503,
+        detail=(
+            f"Image-gen models not ready ({_prewarm_step}). "
+            "Check notebook logs for pre-warm errors."
+        ),
+    )
 
 
 # ── PDF layout extraction (mirrors laptop server) ────────────────────────────
@@ -521,6 +619,10 @@ def health(_: None = Depends(verify_token)):
         "nllb_loaded": _nllb_model is not None,
         "llm_loaded": _llm is not None,
         "image_gen_layer": 2,
+        "image_gen_mode": "sdxl_img2img",
+        "image_gen_prewarm": _image_gen_ready,
+        "prewarm_in_progress": _prewarm_in_progress,
+        "prewarm_step": _prewarm_step,
         "vram": get_vram_stats(),
     }
 
@@ -568,6 +670,7 @@ def generate_prompt(body: GeneratePromptBody, _: None = Depends(verify_token)):
     """
     Layer 1 — SmolVLM caption + Qwen 7B SDXL prompt refinement (no image output).
     """
+    _require_image_gen_ready()
     pil_img = _decode_request_image(body.image)
     page_text = (body.page_text or "").strip()
     print(
@@ -587,8 +690,9 @@ def generate_prompt(body: GeneratePromptBody, _: None = Depends(verify_token)):
 @app.post("/generate_image")
 def generate_image(body: GenerateImageBody, _: None = Depends(verify_token)):
     """
-    Layer 1 + 2 — SmolVLM caption → Qwen prompt → SDXL PNG.
+    Layer 1 + 2 — SmolVLM caption → Qwen prompt → SDXL img2img PNG.
     """
+    _require_image_gen_ready()
     pil_img = _decode_request_image(body.image)
     page_text = (body.page_text or "").strip()
     print(
@@ -692,7 +796,7 @@ def main():
     print(f"  port={PORT}  gpus=2 expected  nllb={NLLB_MODEL}")
     log_vram_snapshot("startup")
 
-    threading.Thread(target=_prewarm_nllb, daemon=True).start()
+    threading.Thread(target=_prewarm_all_models, daemon=True).start()
 
     server = threading.Thread(
         target=lambda: uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="warning"),

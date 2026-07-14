@@ -171,6 +171,8 @@ def kaggle_generate_prompt(
     )
     if not resp.ok:
         detail = resp.text[:500]
+        if resp.status_code == 503:
+            raise RuntimeError(f"Kaggle image-gen not ready (503): {detail}")
         raise RuntimeError(f"Kaggle /generate_prompt failed ({resp.status_code}): {detail}")
     data = resp.json()
     if not isinstance(data.get("prompt"), str) or not data["prompt"].strip():
@@ -199,6 +201,8 @@ def kaggle_generate_image(
     )
     if not resp.ok:
         detail = resp.text[:500]
+        if resp.status_code == 503:
+            raise RuntimeError(f"Kaggle image-gen not ready (503): {detail}")
         raise RuntimeError(f"Kaggle /generate_image failed ({resp.status_code}): {detail}")
     data = resp.json()
     if not isinstance(data.get("image"), str) or not data["image"].strip():

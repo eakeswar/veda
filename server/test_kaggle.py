@@ -231,7 +231,7 @@ def main():
     parser.add_argument(
         "--generate-trial",
         action="store_true",
-        help="Test Layer 2 /generate_image (SmolVLM + Qwen + SDXL) on Kaggle",
+        help="Test Layer 2 /generate_image (SmolVLM + Qwen + SDXL img2img) on Kaggle",
     )
     parser.add_argument(
         "--translate-trial",

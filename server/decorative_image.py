@@ -4,6 +4,12 @@ from __future__ import annotations
 OVERLAP_INFORMATIONAL = 8
 OVERLAP_CHART = 5
 OVERLAP_SCREENSHOT = 3
+TINY_IMAGE_MAX_DIM = 400
+
+
+def is_tiny_image(width: int, height: int, max_dim: int = TINY_IMAGE_MAX_DIM) -> bool:
+    """True when either dimension is below max_dim (matches Lanczos tiny threshold)."""
+    return width < max_dim or height < max_dim
 
 
 def is_decorative_image(
