@@ -231,7 +231,7 @@ def main():
     parser.add_argument(
         "--generate-trial",
         action="store_true",
-        help="Test Layer 2 /generate_image (SmolVLM + Qwen + SDXL img2img) on Kaggle",
+        help="Test Layer 2 /generate_image (SmolVLM + Qwen + img2img) on Kaggle",
     )
     parser.add_argument(
         "--translate-trial",
@@ -277,6 +277,10 @@ def main():
     print("\nTip: run with --compare after Kaggle notebook is up to benchmark local vs GPU.")
     print("Tip: run with --kaggle-only to test the tunnel without the local server.")
     print("Tip: run with --prompt-trial to test Layer 1 image prompt generation on Kaggle.")
+    print("Tip: run with --generate-trial to test Layer 2 img2img on Kaggle (default model: segmind/SSD-1B).")
+    print("Tip: compare img2img models on Kaggle by setting SDXL_MODEL in notebook Cell 2, e.g.")
+    print("       SDXL_MODEL=stabilityai/stable-diffusion-xl-base-1.0  (full SDXL, ~6 GB)")
+    print("       SDXL_MODEL=segmind/Segmind-Vega  (smallest, ~2 GB)")
     print("Tip: run with --translate-trial to verify NLLB translation on Kaggle.")
 
 

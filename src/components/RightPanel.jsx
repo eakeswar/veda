@@ -165,6 +165,23 @@ function mergeSemanticDeck(deck, semanticData) {
   }
 }
 
+/** Apply upscaled URLs to every cached deck variant for one page. */
+function patchPageCacheUpscaled(prev, pageNum, urlMap) {
+  if (!pageNum || !urlMap || Object.keys(urlMap).length === 0) return prev
+  const prefix = `${pageNum}_`
+  let changed = false
+  const next = { ...prev }
+  for (const key of Object.keys(next)) {
+    if (!key.startsWith(prefix)) continue
+    const patched = applyUpscaledImages(next[key], urlMap)
+    if (patched !== next[key]) {
+      next[key] = patched
+      changed = true
+    }
+  }
+  return changed ? next : prev
+}
+
 /** Apply a {originalUrl → upscaledUrl} map to deck.images and topics[*].image. */
 function applyUpscaledImages(deck, urlMap) {
   if (!deck || !urlMap || Object.keys(urlMap).length === 0) return deck
@@ -408,6 +425,7 @@ export default function RightPanel({ sidebarOpen, onToggleSidebar }) {
   // when the semantic/Telugu deck replaces the heuristic deck it immediately
   // inherits any already-upscaled images without another round-trip.
   const upscaledUrlMapRef = useRef({})
+  const upscalePageRef = useRef(null)
 
   // Tracks which page number the current pageDeck was built for.
   // Used to prevent reusing an old deck when navigating to a new page in Telugu mode.
@@ -845,7 +863,10 @@ export default function RightPanel({ sidebarOpen, onToggleSidebar }) {
     // Always clear stale deck immediately so old page content never shows during navigation
     setPageDeck(null)
     setPendingSemanticDeck(null)
-    upscaledUrlMapRef.current = {}   // reset per-page upscale cache
+    if (upscalePageRef.current !== state.selectedPage) {
+      upscaledUrlMapRef.current = {}
+      upscalePageRef.current = state.selectedPage
+    }
 
     if (!state.pdfDoc || !state.selectedPage) {
       setIsAnalyzing(false)
@@ -860,7 +881,7 @@ export default function RightPanel({ sidebarOpen, onToggleSidebar }) {
       handleStop()
       dispatch({ type: 'SET_PAGE_TEXT', payload: cachedDeck.sourceText || '' })
       pageDeckPageRef.current = state.selectedPage
-      setPageDeck(cachedDeck)
+      setPageDeck(applyUpscaledImages(cachedDeck, upscaledUrlMapRef.current))
       setIsPreparing(false)
       setIsAnalyzing(false)
       setPendingSemanticDeck(null)
@@ -871,9 +892,12 @@ export default function RightPanel({ sidebarOpen, onToggleSidebar }) {
     // Fast path: translate existing deck to Telugu (works even when local LLM is unavailable)
     if (state.language === 'te-IN') {
       const enCacheKey = `${state.selectedPage}_en-US`
-      // Only fall back to pageDeckRef if it was built for THIS page (language switch, not navigation)
+      // Prefer live deck on language switch — cache may lack upscaled image URLs.
       const samePage = pageDeckPageRef.current === state.selectedPage
-      const sourceDeck = pageCacheRef.current[enCacheKey] || (samePage ? pageDeckRef.current : null)
+      const rawSource = (samePage ? pageDeckRef.current : null) || pageCacheRef.current[enCacheKey]
+      const sourceDeck = rawSource
+        ? applyUpscaledImages(rawSource, upscaledUrlMapRef.current)
+        : null
       if (sourceDeck && (sourceDeck.title || sourceDeck.topics?.length)) {
         let isCancelled = false
         setIsPreparing(false)
@@ -890,12 +914,16 @@ export default function RightPanel({ sidebarOpen, onToggleSidebar }) {
               setIsAnalyzing(false)
               return
             }
+            const withUpscaledImages = applyUpscaledImages(
+              translatedDeck,
+              upscaledUrlMapRef.current
+            )
             setIsAnalyzing(false)
-            setPageCache((prev) => ({ ...prev, [cacheKey]: translatedDeck }))
+            setPageCache((prev) => ({ ...prev, [cacheKey]: withUpscaledImages }))
             if (ttsStateRef.current === 'idle') {
-              setPageDeck(translatedDeck)
+              setPageDeck(withUpscaledImages)
             } else {
-              setPendingSemanticDeck(translatedDeck)
+              setPendingSemanticDeck(withUpscaledImages)
             }
           })
           .catch((err) => {
@@ -993,6 +1021,7 @@ export default function RightPanel({ sidebarOpen, onToggleSidebar }) {
               // Persist in ref so future deck swaps can apply it immediately
               upscaledUrlMapRef.current = { ...upscaledUrlMapRef.current, ...urlMap }
               setPageDeck((prev) => applyUpscaledImages(prev, urlMap))
+              setPageCache((prev) => patchPageCacheUpscaled(prev, state.selectedPage, urlMap))
             })
             .catch(() => {/* upscaling is optional — silently ignore failures */})
         }
@@ -1054,8 +1083,12 @@ export default function RightPanel({ sidebarOpen, onToggleSidebar }) {
               fetchTranslatedFields(finalDeck, ['highlights', 'supportingPoints'], state.language)
                 .then((enriched) => {
                   if (!enriched || isCancelled) return
-                  setPageDeck(enriched)
-                  setPageCache((prev) => ({ ...prev, [semanticCacheKey]: enriched }))
+                  const withUpscaledImages = applyUpscaledImages(
+                    enriched,
+                    upscaledUrlMapRef.current
+                  )
+                  setPageDeck(withUpscaledImages)
+                  setPageCache((prev) => ({ ...prev, [semanticCacheKey]: withUpscaledImages }))
                 })
                 .catch(() => {})
             }

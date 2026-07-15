@@ -1,4 +1,4 @@
-"""Kaggle-only image generation: Layer 1 SmolVLM+Qwen prompt, Layer 2 SDXL img2img."""
+"""Kaggle-only image generation: Layer 1 SmolVLM+Qwen prompt, Layer 2 SSD-1B img2img (SDXL-arch)."""
 from __future__ import annotations
 
 import base64
@@ -10,7 +10,8 @@ from typing import Any
 
 SMOLVLM_MODEL = os.environ.get("SMOLVLM_MODEL", "HuggingFaceTB/SmolVLM-500M-Instruct")
 SMOLVLM_DEVICE = os.environ.get("SMOLVLM_DEVICE", "cuda:0")
-SDXL_MODEL = os.environ.get("SDXL_MODEL", "stabilityai/stable-diffusion-xl-base-1.0")
+# SDXL-architecture img2img; SSD-1B is ~50% smaller/faster than base SDXL with near-identical quality.
+SDXL_MODEL = os.environ.get("SDXL_MODEL", "segmind/SSD-1B")
 SDXL_DEVICE = os.environ.get("SDXL_DEVICE", "cuda:1")
 SDXL_STEPS = int(os.environ.get("SDXL_STEPS", "20"))
 SDXL_GUIDANCE = float(os.environ.get("SDXL_GUIDANCE", "6.0"))
@@ -54,6 +55,25 @@ _smolvlm_lock = threading.Lock()
 
 _sdxl_pipe = None
 _sdxl_lock = threading.Lock()
+
+
+def _img2img_method_tag() -> str:
+    """Response method suffix derived from SDXL_MODEL env (ssd1b, vega, or sdxl)."""
+    model = SDXL_MODEL.lower()
+    if "ssd-1b" in model or "ssd_1b" in model:
+        return "ssd1b_img2img"
+    if "vega" in model:
+        return "vega_img2img"
+    return "sdxl_img2img"
+
+
+def _img2img_download_hint() -> str:
+    model = SDXL_MODEL.lower()
+    if "ssd-1b" in model or "ssd_1b" in model:
+        return "~3 GB"
+    if "vega" in model:
+        return "~2 GB"
+    return "~6 GB"
 
 
 def get_vram_stats() -> dict[str, Any]:
@@ -286,11 +306,14 @@ def _load_sdxl_pipeline():
     from diffusers import StableDiffusionXLImg2ImgPipeline
 
     hf_kw = _hf_hub_kwargs()
-    print(f"Veda image-gen: loading SDXL img2img ({SDXL_MODEL}) on {SDXL_DEVICE} …")
+    print(f"Veda image-gen: loading img2img ({SDXL_MODEL}) on {SDXL_DEVICE} …")
     log_vram_snapshot("before_sdxl_load")
 
     dtype = torch.float16 if SDXL_DEVICE.startswith("cuda") else torch.float32
-    print("Veda image-gen: downloading SDXL weights (this is the largest download, ~6 GB) …")
+    print(
+        f"Veda image-gen: downloading img2img weights "
+        f"(largest download in pre-warm, {_img2img_download_hint()}) …"
+    )
     pipe = StableDiffusionXLImg2ImgPipeline.from_pretrained(
         SDXL_MODEL,
         torch_dtype=dtype,
@@ -298,7 +321,7 @@ def _load_sdxl_pipeline():
         variant="fp16" if dtype == torch.float16 else None,
         **hf_kw,
     )
-    print(f"Veda image-gen: moving SDXL to {SDXL_DEVICE} …")
+    print(f"Veda image-gen: moving img2img pipeline to {SDXL_DEVICE} …")
     pipe = pipe.to(SDXL_DEVICE)
     pipe.enable_attention_slicing()
     if hasattr(pipe, "enable_vae_slicing"):
@@ -307,7 +330,7 @@ def _load_sdxl_pipeline():
 
     _sdxl_pipe = pipe
     log_vram_snapshot("after_sdxl_load")
-    print("Veda image-gen: SDXL img2img ready.")
+    print(f"Veda image-gen: img2img ready ({SDXL_MODEL}).")
     return _sdxl_pipe
 
 
@@ -336,7 +359,7 @@ def generate_image_sdxl(prompt: str, pil_img, src_w: int, src_h: int, strength: 
     denoise = max(0.05, min(0.95, denoise))
     init_image = _prepare_init_image(pil_img, out_w, out_h)
     print(
-        f"Veda image-gen: SDXL img2img {out_w}×{out_h} px, "
+        f"Veda image-gen: img2img {out_w}×{out_h} px, "
         f"steps={SDXL_STEPS}, strength={denoise:.2f}"
     )
 
@@ -398,19 +421,20 @@ def run_layer2(prompt: str, pil_img, src_w: int, src_h: int) -> dict[str, Any]:
         "image": pil_to_data_url(image),
         "width": out_w,
         "height": out_h,
-        "method": "sdxl_img2img",
+        "method": _img2img_method_tag(),
     }
 
 
 def run_full_pipeline(pil_img, page_text: str, llm, llm_lock) -> dict[str, Any]:
-    """Layer 1 + Layer 2: caption → prompt → SDXL img2img PNG."""
+    """Layer 1 + Layer 2: caption → prompt → img2img PNG."""
     layer1 = run_layer1(pil_img, page_text, llm, llm_lock)
     layer2 = run_layer2(layer1["prompt"], pil_img, pil_img.width, pil_img.height)
+    tag = _img2img_method_tag().replace("_img2img", "")
     return {
         "caption": layer1["caption"],
         "prompt": layer1["prompt"],
         "image": layer2["image"],
         "width": layer2["width"],
         "height": layer2["height"],
-        "method": "layer2_smolvlm_qwen_sdxl_img2img",
+        "method": f"layer2_smolvlm_qwen_{tag}_img2img",
     }

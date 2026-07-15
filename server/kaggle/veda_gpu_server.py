@@ -214,6 +214,7 @@ else:
     sys.path.insert(0, str(WORKING))
 
 from image_gen_service import (  # noqa: E402
+    SDXL_MODEL,
     get_sdxl_pipeline,
     get_smolvlm,
     get_vram_stats,
@@ -504,9 +505,9 @@ def _prewarm_all_models() -> None:
         print("Veda: SmolVLM pre-warm complete.")
         log_vram_snapshot("after_smolvlm")
 
-        _set_prewarm_step("4/4 SDXL img2img")
+        _set_prewarm_step("4/4 img2img")
         get_sdxl_pipeline()
-        print("Veda: SDXL img2img pre-warm complete.")
+        print("Veda: img2img pre-warm complete.")
         log_vram_snapshot("after_sdxl")
 
         with _image_gen_prewarm_lock:
@@ -619,7 +620,8 @@ def health(_: None = Depends(verify_token)):
         "nllb_loaded": _nllb_model is not None,
         "llm_loaded": _llm is not None,
         "image_gen_layer": 2,
-        "image_gen_mode": "sdxl_img2img",
+        "image_gen_mode": "img2img",
+        "img2img_model": SDXL_MODEL,
         "image_gen_prewarm": _image_gen_ready,
         "prewarm_in_progress": _prewarm_in_progress,
         "prewarm_step": _prewarm_step,

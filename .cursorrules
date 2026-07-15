@@ -184,12 +184,13 @@ when `IMAGE_GEN_PROVIDER=auto|kaggle` and Kaggle is reachable; any failure silen
 - Endpoint: `POST /generate_prompt` (debug — no image output)
 
 #### Layer 2 — generation (cuda:1, shares GPU with NLLB-600M)
-- **SDXL img2img** `stabilityai/stable-diffusion-xl-base-1.0` (fp16, safetensors)
+- **SSD-1B img2img** `segmind/SSD-1B` (default; SDXL-architecture, ~3 GB, ~60% faster than base SDXL)
+- Override: `SDXL_MODEL=stabilityai/stable-diffusion-xl-base-1.0` (~6 GB) or `segmind/Segmind-Vega` (~2 GB)
 - Uses **original PDF image as init image** with low denoising strength (`SDXL_STRENGTH` ~0.35)
 - Output clamped 512–1024px, multiple of 8; VRAM-aware max side (768 or 1024)
 - Negative prompt: text, watermark, logo, words, changed composition, etc.
 - Endpoint: `POST /generate_image` → `{ caption, prompt, image, width, height, method }`
-- Method: `layer2_smolvlm_qwen_sdxl_img2img` / `sdxl_img2img`
+- Method: `layer2_smolvlm_qwen_ssd1b_img2img` / `ssd1b_img2img` (or `sdxl_img2img` when using base SDXL)
 
 #### Laptop routing (`tts_server.py` `/upscale_image`)
 - `decorative_image.is_decorative_image()` using `overlapWordCount` + page metadata from layout
@@ -365,6 +366,7 @@ IMAGE_GEN_PROVIDER=auto        # auto|kaggle|local — decorative SDXL routing (
 # IMAGE_GEN_PREWARM=1          # Kaggle: sequential model pre-load at startup (default on)
 # HF_TOKEN=hf_...              # Kaggle notebook secret only — not laptop .env
 # SDXL_STRENGTH=0.35           # img2img denoising (0.25–0.45 faithful)
+# SDXL_MODEL=segmind/SSD-1B      # default img2img (~3 GB); override: stabilityai/stable-diffusion-xl-base-1.0
 
 # Kaggle official API — publish project-models from laptop
 KAGGLE_USERNAME=your_username
@@ -461,8 +463,9 @@ over stale shell environment variables.
 - Turn ON: publish bundle → attach latest dataset → Run notebook → copy tunnel URL → `.env` → restart backend
 - Turn OFF: stop notebook → `KAGGLE_ENABLED=false` → restart backend
 
-## AI Image Generation Pipeline — DONE (Jul 10 2026, img2img + pre-warm Jul 14 2026)
-- `server/kaggle/image_gen_service.py` — Layer 1 (SmolVLM caption → Qwen prompt) + Layer 2 (SDXL img2img)
+## AI Image Generation Pipeline — DONE (Jul 10 2026, img2img + pre-warm Jul 14 2026, SSD-1B default Jul 15 2026)
+- `server/kaggle/image_gen_service.py` — Layer 1 (SmolVLM caption → Qwen prompt) + Layer 2 (SSD-1B img2img default)
+- Default img2img: `segmind/SSD-1B` (~3 GB, ~60% faster load/inference vs base SDXL); override via `SDXL_MODEL`
 - `server/decorative_image.py` — heuristic decorative vs informational + `is_tiny_image()` size gate
 - `server/page_layout_service.py` — `overlapWordCount` per image for routing
 - Kaggle endpoints: `POST /generate_prompt`, `POST /generate_image`; `/health` reports pre-warm status
