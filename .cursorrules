@@ -103,8 +103,11 @@ before restarting the backend. `load_dotenv(..., override=True)` so `.env` wins 
 5. **Cell 1:** copy from dataset to `/kaggle/working/`: `veda_gpu_server.py`, `security.py`,
    `qwen_config.py`, `analyze_prompts.py`, `page_layout_service.py`, `image_gen_service.py`
    (do **not** copy `upscale_service.py` / `rrdb_net.py` — removed with Real-ESRGAN)
-6. **Cell 2:** load `HF_TOKEN` via `UserSecretsClient`, `VEDA_QUIET=0`, `KAGGLE_API_SECRET`, run server
-7. **Wait for pre-warm** (`all model pre-warm complete`) — first run ~10–20 min; **do not cancel**
+6. **Cell 2:** load `HF_TOKEN` via `UserSecretsClient`, set `HF_HOME` + `HUGGING_FACE_HUB_CACHE` to
+   `/kaggle/working/hf_cache` (persists downloads across re-runs — do not "Restart & Clear All"),
+   `VEDA_QUIET=0`, `KAGGLE_API_SECRET`, run server. Default img2img is `segmind/SSD-1B` (no env needed).
+7. **Wait for pre-warm** (`all model pre-warm complete`) — first run ~7–15 min with SSD-1B; **do not cancel**
+   Warm re-runs with HF cache in working: ~2–4 min
 8. Copy tunnel URL to laptop `server/.env` → restart backend
 9. Keep notebook running; stop session when done (GPU hours tick while open)
 
@@ -267,7 +270,8 @@ Raw `/page_layout` lines are post-processed in `pdfUtils.js` before slide build 
 13. Magazine callout pages (Discovery Q&A spreads) may still need Phase 2 GPU layout parser
 14. SDXL img2img fidelity depends on `SDXL_STRENGTH` — tune 0.25–0.45 if output still drifts
 15. Only **tiny decorative** images get SDXL — larger decorative use Lanczos; many photos stay informational due to `overlapWordCount`
-16. **First Kaggle session pre-warm ~10–20 min** — NLLB + SmolVLM + SDXL HF downloads; set `HF_TOKEN`, `VEDA_QUIET=0`, do not cancel
+16. **First Kaggle session pre-warm ~7–15 min** (SSD-1B ~3 GB vs old SDXL ~6 GB); set `HF_TOKEN`,
+    `HF_HOME=/kaggle/working/hf_cache`, `VEDA_QUIET=0`, do not cancel. Warm re-run ~2–4 min.
 17. **Cloudflare 524** on image-gen if pre-warm incomplete — wait for `image_gen_prewarm: true` in Kaggle `/health`
 18. `/generate_prompt` and `/generate_image` return **503** while `prewarm_in_progress` — laptop falls back to Lanczos
 19. Kaggle `/health` (GPU server): `prewarm_step`, `prewarm_in_progress`, `image_gen_prewarm`, `nllb_loaded`, `llm_loaded`
@@ -328,6 +332,14 @@ Raw `/page_layout` lines are post-processed in `pdfUtils.js` before slide build 
   by backend before translation) to re-match images from heuristic topics to LLM topics
 - titleSimilarity() uses word-overlap (Jaccard) between topic titles
 - Positional fallback if all similarity scores are zero
+
+### Upscaled image persistence across language switch (Jul 15 2026)
+- `upscaleImages()` in `pdfUtils.js` fires async; results stored in `upscaledUrlMapRef` (per page)
+- `applyUpscaledImages(deck, urlMap)` swaps original data-URLs → upscaled in `deck.images` + `topics[*].image`
+- `patchPageCacheUpscaled()` updates all `pageCache` entries for a page when upscaling completes
+- `upscaledUrlMapRef` resets on **page** change only — not on EN ↔ TE language toggle
+- Telugu fast path prefers live `pageDeckRef` over stale English `pageCache` (cache saved before upscale finished)
+- Telugu translate applies upscale map before display and when writing `te-IN` cache
 
 ---
 
@@ -401,7 +413,12 @@ over stale shell environment variables.
 4. **Phase 2 GPU layout parser** — Docling/Marker or vision model on Kaggle for decorative magazine pages
 5. **SDXL img2img** — DONE (Jul 14 2026): faithful enhancement from original pixels
 6. **Sequential pre-warm + HF_TOKEN** — DONE (Jul 14 2026): avoids Cloudflare 524 on first load
-7. **Disk cache for generated images** — Cache by image hash + page text to avoid repeat Kaggle SDXL calls
+7. **Disk cache for generated images** — partial (Jul 15): frontend `pageCache`/`upscaledUrlMapRef`; TODO: server disk cache by image hash
+
+## Telugu Upscale Persistence — DONE (Jul 15 2026)
+- `RightPanel.jsx`: `applyUpscaledImages`, `patchPageCacheUpscaled`, `upscaledUrlMapRef` (per-page, survives EN↔TE)
+- Upscale completion patches all language cache keys for current page
+- Telugu fast path prefers live deck over stale English cache; applies upscale map after `/translate_deck`
 
 ## Security & Repo Cleanup — DONE (Jul 8 2026)
 - `server/security.py` — payload limits, PDF validation, CORS helpers, `require_kaggle_secret()`
@@ -469,14 +486,22 @@ over stale shell environment variables.
 - `server/decorative_image.py` — heuristic decorative vs informational + `is_tiny_image()` size gate
 - `server/page_layout_service.py` — `overlapWordCount` per image for routing
 - Kaggle endpoints: `POST /generate_prompt`, `POST /generate_image`; `/health` reports pre-warm status
-- `_prewarm_all_models()` — sequential NLLB → Qwen → SmolVLM → SDXL; 503 guard during load
+- `_prewarm_all_models()` — sequential NLLB → Qwen → SmolVLM → img2img (SSD-1B); 503 guard during load
 - `kaggle_client.kaggle_generate_prompt()` / `kaggle_generate_image()` — 503-aware tunnel clients
 - `tts_server.py` `/upscale_image` — routes tiny decorative to Kaggle img2img, silent Lanczos fallback
 - Frontend: `pdfUtils.upscaleImages()` + `RightPanel.jsx` pass page context and `imagesMeta`
 - `test_kaggle.py`: `--prompt-trial`, `--generate-trial`, `--translate-trial`
 - Bundle: `prepare_kaggle_dataset.bat` copies `image_gen_service.py` + `veda_gpu_server.py` into `project-models`
-- GPU pinning: SmolVLM + Qwen on cuda:0; SDXL + NLLB on cuda:1 (T4 x2, 16 GB each)
-- Kaggle notebook: `HF_TOKEN` secret + `UserSecretsClient`; `VEDA_QUIET=0` for first-run visibility
+- GPU pinning: SmolVLM + Qwen on cuda:0; SSD-1B img2img + NLLB on cuda:1 (T4 x2, 16 GB each)
+- Kaggle notebook: `HF_TOKEN` secret + `UserSecretsClient`; `HF_HOME=/kaggle/working/hf_cache`; `VEDA_QUIET=0` first run
+- `/health` (Kaggle): `img2img_model`, `image_gen_mode`, `prewarm_step`, `image_gen_prewarm`
+
+### AI Image Gen — Problems Faced (Jul 15 2026)
+14. **Telugu switch reverted upscaled images** — English `pageCache` saved before async upscale finished;
+    language toggle used stale cache. Fix: `applyUpscaledImages` on TE path, prefer live `pageDeckRef`,
+    patch `pageCache` on upscale complete, keep `upscaledUrlMapRef` across language toggles (same page).
+15. **Slow cold pre-warm** — mostly HF re-downloads (~7 GB total). Mitigations: SSD-1B (~3 GB not ~6 GB),
+    persist `HF_HOME` in `/kaggle/working/hf_cache`, optional bundle HF models in dataset (not yet done).
 
 ### AI Image Gen — Problems Faced (Jul 10 2026)
 1. **Pillow `_Ink` import error** on Kaggle — Pillow 12.x vs old torchvision/transformers stack.
