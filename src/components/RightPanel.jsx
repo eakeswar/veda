@@ -96,6 +96,26 @@ function titleSimilarity(a = '', b = '') {
   return union === 0 ? 0 : intersection / union
 }
 
+/** Merge LLM digest topic text with PDF heuristic body — keep LLM polish, add extra PDF sentences. */
+function mergeDigestTopicBody(llmTopic, heuristicTopic) {
+  const llm = (llmTopic?.body || llmTopic?.summary || '').trim()
+  const pdf = (heuristicTopic?.body || '').trim()
+  if (!pdf) return llm
+  if (!llm) return pdf
+  const llmLower = llm.toLowerCase()
+  const extraSentences = pdf
+    .split(/(?<=[.!?])\s+/)
+    .filter((s) => {
+      const t = s.trim()
+      return t.length > 20 && !llmLower.includes(t.slice(0, 40).toLowerCase())
+    })
+    .slice(0, 2)
+  if (extraSentences.length === 0) {
+    return llm.length >= pdf.length ? llm : pdf
+  }
+  return `${llm} ${extraSentences.join(' ')}`.replace(/\s+/g, ' ').trim()
+}
+
 function mergeSemanticDeck(deck, semanticData) {
   if (!semanticData) return deck
 
@@ -123,7 +143,7 @@ function mergeSemanticDeck(deck, semanticData) {
         }
         return {
           ...t,
-          body: t.body || t.summary || '',
+          body: mergeDigestTopicBody(t, bestIdx >= 0 ? deck.topics[bestIdx] : null),
           image: bestIdx >= 0 ? (deck.topics[bestIdx]?.image || null) : null,
         }
       })

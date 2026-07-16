@@ -1159,7 +1159,7 @@ export async function extractPagePresentation(pdfDoc, pageNumber, fallbackTitle 
       summary,
       topics: topics.map((t, idx) => ({
         title: t.title,
-        body: t.sentences.slice(0, 3).join(' '),
+        body: t.sentences.slice(0, 4).join(' '),
         image: matchedImages[idx] || null
       })),
       highlights,
