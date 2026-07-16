@@ -22,10 +22,10 @@ veda/
     analyze_prompts.py    ← Shared LLM prompts + JSON extract (local + Kaggle)
     kaggle_client.py      ← HTTP client for Kaggle GPU tunnel
     page_layout_service.py← PDF page layout extraction (local + Kaggle)
-    upscale_service.py    ← Lanczos-only upscaling (YuNet/HOG people-aware routing)
+    upscale_service.py    ← Lanczos upscaling; YuNet people detect (thread-locked for routing)
     data/
       face_detection_yunet_2023mar.onnx ← YuNet face detector (~230 KB, OpenCV 5)
-    decorative_image.py   ← Heuristic decorative vs informational image routing (no ML)
+    decorative_image.py   ← Phase 1 image routing: informational vs subject → img2img/Lanczos
     kaggle/
       image_gen_service.py← Kaggle-only Layer 1+2: SmolVLM → Qwen → SDXL (not on laptop)
       veda_gpu_server.py  ← Run in Kaggle notebook (GPU T4 x2 + cloudflared tunnel)
@@ -54,7 +54,7 @@ veda/
       LeftPanel.jsx       ← PDF TOC sidebar
       RightPanel.jsx      ← Main presentation + karaoke
     context/
-      PDFContext.jsx      ← useReducer + Context API for global state
+      PDFContext.jsx      ← useReducer + Context API; syncs theme to `<html data-theme>`
     utils/
       pdfUtils.js         ← PDF.js utilities, page analysis, image extraction
       speechUtils.js      ← Speech/audio utilities
@@ -75,7 +75,7 @@ unreachable, or hours are spent, **everything falls back to local CPU** automati
 | PDF layout (`/page_layout`) | Kaggle CPU (pdfplumber + PyMuPDF) | `page_layout_service.py` |
 | Slide analysis (`/analyze`) | Qwen **7B** on GPU (llama-cpp) | Local Qwen **3B** via `LLMState` |
 | Telugu translation | NLLB-600M on GPU | Local NLLB-1.3B |
-| Decorative image gen | Kaggle SDXL (Layer 1+2) via tunnel | Lanczos fallback (no local GPU gen) |
+| Decorative image gen | Kaggle SSD-1B img2img (Layer 1+2) via tunnel | Lanczos fallback (no local GPU gen) |
 | Image upscale (informational) | **Always laptop** (Lanczos) | Same — `upscale_service.py` on CPU |
 | TTS / karaoke | Always laptop | Sarvam → edge-tts fallback |
 
@@ -131,7 +131,7 @@ before restarting the backend. `load_dotenv(..., override=True)` so `.env` wins 
 | GET | /tts_stream | Streams audio (Sarvam or edge-tts fallback) |
 | POST | /tts_boundaries | Returns only word_boundaries (no audio) |
 | POST | /transcribe | OpenAI Whisper STT → returns { text, word_boundaries[] } |
-| POST | /upscale_image | Tiny decorative → Kaggle SDXL img2img; informational/large decorative → Lanczos on laptop |
+| POST | /upscale_image | Subject routing → Kaggle img2img or Lanczos on laptop (see Phase 1 routing) |
 
 ### Key Classes & Functions
 - `security.py` — `validate_pdf_bytes()`, `require_kaggle_secret()`, `cors_origins()`, payload limits
@@ -147,8 +147,10 @@ before restarting the backend. `load_dotenv(..., override=True)` so `.env` wins 
 - `translate_strings_for_deck()` — Kaggle-first; falls back to local NLLB if Kaggle fails
 - `kaggle_client` — `should_use_kaggle()`, `kaggle_analyze()`, `kaggle_translate()`,
   `kaggle_page_layout()`, `kaggle_upload_pdf()`, `kaggle_generate_prompt()`, `kaggle_generate_image()`
-- `decorative_image.is_decorative_image()` / `is_tiny_image()` — decorative + size gate before image gen
-- `image_gen_service.run_layer1()` / `run_full_pipeline()` — Kaggle-only (SmolVLM + Qwen + SDXL)
+- `decorative_image.should_route_img2img()` — Phase 1 routing (informational / people / photo_tiny / lanczos)
+- `decorative_image.is_informational_image()` / `is_photo_like_decorative()` / `is_tiny_image()`
+- `upscale_service.detect_people_for_routing()` — YuNet for img2img routing only (thread-locked `_face_detect_lock`)
+- `image_gen_service.run_layer1()` / `run_full_pipeline()` — Kaggle-only (SmolVLM + Qwen + SSD-1B img2img)
 - `detect_speech_boundaries(wav_bytes)` — finds lead-in/lead-out silence in WAV
 - `adjust_boundaries_to_silence(boundaries, wav_bytes)` — corrects STT timestamps
 - `generate_fallback_boundaries(text, duration)` — proportional fallback if STT fails
@@ -195,18 +197,25 @@ when `IMAGE_GEN_PROVIDER=auto|kaggle` and Kaggle is reachable; any failure silen
 - Endpoint: `POST /generate_image` → `{ caption, prompt, image, width, height, method }`
 - Method: `layer2_smolvlm_qwen_ssd1b_img2img` / `ssd1b_img2img` (or `sdxl_img2img` when using base SDXL)
 
-#### Laptop routing (`tts_server.py` `/upscale_image`)
-- `decorative_image.is_decorative_image()` using `overlapWordCount` + page metadata from layout
-- **Size gate**: only **tiny** decorative images (`w < 400` or `h < 400`) → Kaggle img2img
-- Larger decorative images → Lanczos (already decent size)
+#### Laptop routing (`tts_server.py` `/upscale_image`) — Phase 1 subject routing (Jul 16 2026)
+- `should_route_img2img()` in `decorative_image.py` — **laptop-only**; Kaggle only sees `/generate_image` when this returns True
+- **Informational** (charts, screenshots, high `overlapWordCount`) → Lanczos always
+- **People** (YuNet face detect; HOG optional — may fail on OpenCV 5) → Kaggle img2img up to `IMAGE_GEN_MAX_DIM` (default 1024)
+- **Photo-like decorative + tiny** (`w < 400` or `h < 400`, low overlap) → Kaggle img2img
+- **Too large** (max side > `IMAGE_GEN_MAX_DIM`) or default → Lanczos
+- `if use_kaggle_gen:` block calls `kaggle_generate_image()` — must NOT be nested under route reason branches (fixed Jul 16)
+- Routing runs even when `image_meta` / page dims missing (people detect still applies)
 - Frontend passes `page_text`, `page_width`, `page_height`, `image_meta`, `is_image_primary` via `upscaleImages()`
-- `kaggle_generate_image()` on decorative+tiny; Lanczos on informational, large decorative, or Kaggle failure
+- Backend logs: `/upscale_image: {route} → Kaggle img2img` then `img2img output [ssd1b_img2img]` on success
+- Kaggle notebook log shows only layout/analyze unless laptop actually calls `/generate_image` — debug on **laptop** backend
+- `kaggle_generate_image()` failure → silent Lanczos fallback with `Kaggle generate failed (...)` log line
 
 #### Decorative vs informational (`decorative_image.py` + `overlapWordCount`)
 - `page_layout_service.py` adds `overlapWordCount` per image (pdfplumber words overlapping bbox > 45%)
+- **Informational**: `overlapWordCount >= 8`, screenshot aspect band, or chart aspect+area heuristics
+- **Photo-like decorative**: `is_image_primary` pages, or inset photo with `overlapWordCount < 3` and normal aspect/area
+- **People path**: YuNet face detection overrides decorative heuristics → img2img (not Lanczos people upscale first)
 - Conservative default: uncertain → Lanczos
-- Decorative: `is_image_primary` pages, or inset photo with `overlapWordCount < 3` and normal aspect/area
-- Informational: `overlapWordCount >= 8`, screenshot/chart patterns
 
 #### Kaggle runtime deps (NOT in server/vendor/)
 - `diffusers`, `accelerate`, `safetensors` — pip-installed at Kaggle notebook startup
@@ -222,7 +231,9 @@ when `IMAGE_GEN_PROVIDER=auto|kaggle` and Kaggle is reachable; any failure silen
 | No people, normal size | Lanczos ×2 + Unsharp Mask | `lanczos_x2` |
 
 - Face model: `server/data/face_detection_yunet_2023mar.onnx` (~230 KB)
-- If YuNet missing, conservatively uses Lanczos (no ESRGAN fallback)
+- YuNet `detect()` wrapped in `_face_detect_lock` — required for parallel `upscaleImages()` from frontend (Jul 16)
+- If YuNet missing, routing skips people path; Lanczos path uses `detect_people()` (conservative)
+- OpenCV 5 may lack `cv2.HOGDescriptor` — face-only people routing when HOG unavailable
 - `UPSCALE_PROVIDER=local` always for Lanczos execution; decorative gen uses `IMAGE_GEN_PROVIDER`
 - Legacy `RealESRGAN_x4plus.pth` / `rrdb_net.py` may remain in server/models/ but are unused
 
@@ -269,12 +280,15 @@ Raw `/page_layout` lines are post-processed in `pdfUtils.js` before slide build 
 12. After republishing `project-models`, re-attach **latest version** in notebook and re-run cells
 13. Magazine callout pages (Discovery Q&A spreads) may still need Phase 2 GPU layout parser
 14. SDXL img2img fidelity depends on `SDXL_STRENGTH` — tune 0.25–0.45 if output still drifts
-15. Only **tiny decorative** images get SDXL — larger decorative use Lanczos; many photos stay informational due to `overlapWordCount`
+15. Only **tiny photo-like decorative** + **people** images get img2img — charts/info stay Lanczos; many photos stay informational due to `overlapWordCount`
 16. **First Kaggle session pre-warm ~7–15 min** (SSD-1B ~3 GB vs old SDXL ~6 GB); set `HF_TOKEN`,
     `HF_HOME=/kaggle/working/hf_cache`, `VEDA_QUIET=0`, do not cancel. Warm re-run ~2–4 min.
 17. **Cloudflare 524** on image-gen if pre-warm incomplete — wait for `image_gen_prewarm: true` in Kaggle `/health`
 18. `/generate_prompt` and `/generate_image` return **503** while `prewarm_in_progress` — laptop falls back to Lanczos
-19. Kaggle `/health` (GPU server): `prewarm_step`, `prewarm_in_progress`, `image_gen_prewarm`, `nllb_loaded`, `llm_loaded`
+19. Kaggle `/health` (GPU server): `prewarm_step`, `prewarm_in_progress`, `image_gen_prewarm`, `img2img_model`, `nllb_loaded`, `llm_loaded`
+20. **img2img never reached Kaggle** (Jul 16 bug): `kaggle_generate_image()` was nested under `too_large` branch — fixed; watch laptop logs not notebook layout log alone
+21. **YuNet concurrent crash** on parallel `/upscale_image` — fixed with `_face_detect_lock` in `upscale_service.py`
+22. **Dark mode toggle broken** (Jul 16): `data-theme` was on inner div; body CSS inverted — fixed via `html[data-theme]` sync in `PDFContext.jsx`
 
 ---
 
@@ -282,6 +296,9 @@ Raw `/page_layout` lines are post-processed in `pdfUtils.js` before slide build 
 
 ### State Management
 - Global state via useReducer + Context API in PDFContext.jsx
+- `theme`: `'light' | 'dark'` — synced to `document.documentElement` (`<html data-theme>` + `color-scheme`)
+- Tailwind `dark:` variant via `@custom-variant dark (&:where([data-theme=dark], [data-theme=dark] *))` in `index.css`
+- Manual 🌙/☀️ toggle only — does not follow OS `prefers-color-scheme`
 - No Redux, no Zustand
 
 ### Fonts
@@ -305,7 +322,7 @@ Raw `/page_layout` lines are post-processed in `pdfUtils.js` before slide build 
 6. LLM returns slide JSON → rendered as slide card in RightPanel
 7. Telugu: translation via Kaggle/local NLLB (`/analyze`, `/translate_deck`, `/translate_fields`)
 8. On play: POST /tts → Sarvam audio + STT boundaries (edge-tts fallback)
-9. Images: POST /upscale_image — decorative → Kaggle SDXL; informational → Lanczos on laptop
+9. Images: POST /upscale_image — Phase 1 subject routing → Kaggle SSD-1B img2img or Lanczos on laptop
 
 ### Digest Pages
 - Pages with 3+ distinct articles are detected as "digest" pages
@@ -314,6 +331,8 @@ Raw `/page_layout` lines are post-processed in `pdfUtils.js` before slide build 
 - Each story is then shown in a carousel (Story 1, Story 2, …) below the image strip
 - Image matching (matchImagesToTopicsGlobal) uses vertical zone assignment:
   each topic owns the vertical band between its heading and the next heading
+- **LLM digest prompts (Jul 16):** per-topic summary 40–55 words (2 sentences); narration 80–100 words (`analyze_prompts.py`)
+- **Heuristic digest body:** 4 sentences from PDF (`pdfUtils.js`); `mergeDigestTopicBody()` in `RightPanel.jsx` merges LLM summary + extra PDF sentences
 
 ### Image-Primary Pages (pdfUtils.js)
 - Pages with images but < 50 words (covers, ads, photo spreads) bypass topic detection and LLM
@@ -379,6 +398,7 @@ IMAGE_GEN_PROVIDER=auto        # auto|kaggle|local — decorative SDXL routing (
 # HF_TOKEN=hf_...              # Kaggle notebook secret only — not laptop .env
 # SDXL_STRENGTH=0.35           # img2img denoising (0.25–0.45 faithful)
 # SDXL_MODEL=segmind/SSD-1B      # default img2img (~3 GB); override: stabilityai/stable-diffusion-xl-base-1.0
+# IMAGE_GEN_MAX_DIM=1024       # max side for img2img routing (people + photo_tiny)
 
 # Kaggle official API — publish project-models from laptop
 KAGGLE_USERNAME=your_username
@@ -419,6 +439,23 @@ over stale shell environment variables.
 - `RightPanel.jsx`: `applyUpscaledImages`, `patchPageCacheUpscaled`, `upscaledUrlMapRef` (per-page, survives EN↔TE)
 - Upscale completion patches all language cache keys for current page
 - Telugu fast path prefers live deck over stale English cache; applies upscale map after `/translate_deck`
+
+## Phase 1 Subject Image Routing — DONE (Jul 16 2026)
+- `decorative_image.py`: `should_route_img2img()`, `is_informational_image()`, `is_photo_like_decorative()`
+- People (YuNet) → img2img; informational → Lanczos; photo-like+tiny → img2img; env `IMAGE_GEN_MAX_DIM` (default 1024)
+- `upscale_service.detect_people_for_routing()` + `_face_detect_lock` for thread-safe parallel upscales
+- `tts_server.py`: fixed `if use_kaggle_gen:` block (was wrongly nested under `too_large` — img2img never called Kaggle)
+- No Kaggle notebook changes — routing is laptop-only
+
+## Digest LLM + Body Merge — DONE (Jul 16 2026)
+- `analyze_prompts.py`: digest topic summaries 40–55 words; narration 80–100 words
+- `pdfUtils.js`: heuristic digest body uses 4 sentences (was 3)
+- `RightPanel.jsx`: `mergeDigestTopicBody()` merges LLM summary with extra PDF sentences from heuristic deck
+
+## Dark Mode Fix — DONE (Jul 16 2026)
+- `PDFContext.jsx`: `useEffect` sets `<html data-theme>` and `color-scheme` on theme change
+- `index.css`: body defaults light; `html[data-theme='dark'] body` for dark; fixed `.veda-tab-btn-idle` light/dark text
+- `RightPanel.jsx`: dock VOICE/RATE labels use `veda-text-muted` (not hardcoded `text-veda-muted-dark`)
 
 ## Security & Repo Cleanup — DONE (Jul 8 2026)
 - `server/security.py` — payload limits, PDF validation, CORS helpers, `require_kaggle_secret()`
@@ -483,18 +520,26 @@ over stale shell environment variables.
 ## AI Image Generation Pipeline — DONE (Jul 10 2026, img2img + pre-warm Jul 14 2026, SSD-1B default Jul 15 2026)
 - `server/kaggle/image_gen_service.py` — Layer 1 (SmolVLM caption → Qwen prompt) + Layer 2 (SSD-1B img2img default)
 - Default img2img: `segmind/SSD-1B` (~3 GB, ~60% faster load/inference vs base SDXL); override via `SDXL_MODEL`
-- `server/decorative_image.py` — heuristic decorative vs informational + `is_tiny_image()` size gate
+- `server/decorative_image.py` — Phase 1 subject routing (`should_route_img2img()`)
 - `server/page_layout_service.py` — `overlapWordCount` per image for routing
 - Kaggle endpoints: `POST /generate_prompt`, `POST /generate_image`; `/health` reports pre-warm status
 - `_prewarm_all_models()` — sequential NLLB → Qwen → SmolVLM → img2img (SSD-1B); 503 guard during load
 - `kaggle_client.kaggle_generate_prompt()` / `kaggle_generate_image()` — 503-aware tunnel clients
-- `tts_server.py` `/upscale_image` — routes tiny decorative to Kaggle img2img, silent Lanczos fallback
+- `tts_server.py` `/upscale_image` — Phase 1 subject routing → Kaggle img2img when `use_kaggle_gen`, silent Lanczos fallback
 - Frontend: `pdfUtils.upscaleImages()` + `RightPanel.jsx` pass page context and `imagesMeta`
 - `test_kaggle.py`: `--prompt-trial`, `--generate-trial`, `--translate-trial`
 - Bundle: `prepare_kaggle_dataset.bat` copies `image_gen_service.py` + `veda_gpu_server.py` into `project-models`
 - GPU pinning: SmolVLM + Qwen on cuda:0; SSD-1B img2img + NLLB on cuda:1 (T4 x2, 16 GB each)
 - Kaggle notebook: `HF_TOKEN` secret + `UserSecretsClient`; `HF_HOME=/kaggle/working/hf_cache`; `VEDA_QUIET=0` first run
 - `/health` (Kaggle): `img2img_model`, `image_gen_mode`, `prewarm_step`, `image_gen_prewarm`
+
+### AI Image Gen — Problems Faced (Jul 16 2026)
+16. **img2img logged but Kaggle never called** — `kaggle_generate_image()` nested under `elif route_reason == "too_large"`
+    instead of `if use_kaggle_gen`. Laptop printed `→ Kaggle img2img` then fell through to Lanczos. Fix: correct branch in `tts_server.py`.
+17. **OpenCV YuNet crash on parallel upscales** — `buf.shape() == m.shape()` when frontend fires concurrent `/upscale_image`.
+    Fix: `_face_detect_lock` around YuNet `detect()` in `upscale_service.py`.
+18. **Misleading debug** — Kaggle notebook only logs layout/analyze unless laptop routes to img2img; check laptop backend for
+    `/upscale_image:` lines and `img2img output [ssd1b_img2img]`.
 
 ### AI Image Gen — Problems Faced (Jul 15 2026)
 14. **Telugu switch reverted upscaled images** — English `pageCache` saved before async upscale finished;
