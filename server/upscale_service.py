@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -26,6 +27,7 @@ FACE_MODEL_NAMES = (
 
 _detector = None
 _detector_unavailable = False
+_face_detect_lock = threading.Lock()
 _hog = None
 _hog_unavailable = False
 
@@ -99,8 +101,9 @@ def image_has_faces(pil_img, score_threshold: float | None = None) -> bool:
 
     rgb = np.array(pil_img.convert("RGB"))
     h, w = rgb.shape[:2]
-    detector.setInputSize((w, h))
-    _, faces = detector.detect(rgb)
+    with _face_detect_lock:
+        detector.setInputSize((w, h))
+        _, faces = detector.detect(rgb)
     if faces is None or len(faces) == 0:
         return False
     return bool((faces[:, 2] >= threshold).any())
@@ -141,6 +144,20 @@ def detect_people(pil_img) -> tuple[bool, str | None]:
     if image_has_faces(pil_img):
         return True, "face"
     if image_has_person_hog(pil_img):
+        return True, "person"
+    return False, None
+
+
+def detect_people_for_routing(pil_img) -> tuple[bool, str | None]:
+    """People detection for img2img routing — False when detectors unavailable (no guess)."""
+    detector = _get_face_detector()
+    if detector is not None:
+        if image_has_faces(pil_img):
+            return True, "face"
+    elif _detector_unavailable:
+        pass  # YuNet missing — do not assume people
+    hog = _get_hog_detector()
+    if hog is not None and image_has_person_hog(pil_img):
         return True, "person"
     return False, None
 

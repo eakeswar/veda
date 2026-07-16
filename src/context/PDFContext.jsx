@@ -1,4 +1,4 @@
-import { createContext, useContext, useReducer } from 'react'
+import { createContext, useContext, useEffect, useReducer } from 'react'
 
 const PDFContext = createContext(null)
 
@@ -49,9 +49,15 @@ export function notifySarvamCreditsExhausted(dispatch) {
 
 export function PDFProvider({ children }) {
   const [state, dispatch] = useReducer(reducer, initialState)
+
+  useEffect(() => {
+    document.documentElement.setAttribute('data-theme', state.theme)
+    document.documentElement.style.colorScheme = state.theme
+  }, [state.theme])
+
   return (
     <PDFContext.Provider value={{ state, dispatch }}>
-      <div data-theme={state.theme} className="h-full min-h-screen">
+      <div className="h-full min-h-screen">
         {children}
       </div>
     </PDFContext.Provider>

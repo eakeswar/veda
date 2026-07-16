@@ -49,13 +49,20 @@
     @apply m-0 w-full min-h-screen;
   }
 
-  body {
-    @apply overflow-hidden bg-veda-surface-dark text-veda-text-dark font-sans;
+  html {
+    color-scheme: light;
   }
 
-  [data-theme='light'] body,
-  [data-theme='light'] {
-    @apply bg-veda-surface text-veda-text;
+  html[data-theme='dark'] {
+    color-scheme: dark;
+  }
+
+  body {
+    @apply overflow-hidden bg-veda-surface text-veda-text font-sans;
+  }
+
+  html[data-theme='dark'] body {
+    @apply bg-veda-surface-dark text-veda-text-dark;
   }
 
   h1,
@@ -311,7 +318,8 @@
   }
 
   .veda-tab-btn-idle {
-    @apply bg-transparent text-veda-muted-dark shadow-none backdrop-blur-none;
+    @apply bg-transparent text-veda-muted shadow-none backdrop-blur-none
+      dark:text-veda-muted-dark;
   }
 
   .veda-takeaway-item {

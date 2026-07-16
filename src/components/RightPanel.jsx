@@ -1792,7 +1792,7 @@ export default function RightPanel({ sidebarOpen, onToggleSidebar }) {
           {/* Right section: View page, Language, & Speed Rate */}
           <div className="flex items-center gap-3 justify-end w-[35%] min-w-[385px]">
             <div className="flex items-center gap-1.5">
-              <span className="text-veda-muted-dark text-[0.65rem] font-bold">VOICE:</span>
+              <span className="veda-text-muted text-[0.65rem] font-bold">VOICE:</span>
               <select
                 value={selectedVoice}
                 onChange={(e) => setSelectedVoice(e.target.value)}
@@ -1815,7 +1815,7 @@ export default function RightPanel({ sidebarOpen, onToggleSidebar }) {
             </div>
 
             <div className="flex items-center gap-1.5">
-              <span className="text-veda-muted-dark text-[0.65rem] font-bold">RATE:</span>
+              <span className="veda-text-muted text-[0.65rem] font-bold">RATE:</span>
               <select
                 value={speechRate}
                 onChange={(e) => setSpeechRate(e.target.value)}

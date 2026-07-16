@@ -30,7 +30,7 @@ except ImportError:
 import requests
 
 from analyze_prompts import build_analyze_messages, extract_analysis_json
-from decorative_image import is_decorative_image, is_tiny_image
+from decorative_image import should_route_img2img
 from kaggle_client import (
     kaggle_analyze,
     kaggle_generate_image,
@@ -1315,29 +1315,33 @@ async def upscale_image(request: Request):
     pil_img = Image.open(BytesIO(img_bytes)).convert("RGB")
 
     w, h = pil_img.width, pil_img.height
-    decorative = False
-    if image_meta and page_width and page_height:
-        try:
-            decorative = is_decorative_image(
-                image_meta,
-                page_width=float(page_width),
-                page_height=float(page_height),
-                page_word_count=page_word_count,
-                is_image_primary=is_image_primary,
-            )
-        except Exception as meta_err:
-            print(f"/upscale_image: decorative check failed ({meta_err}) — Lanczos")
+    use_img2img = False
+    route_reason = "lanczos"
+    try:
+        use_img2img, route_reason = should_route_img2img(
+            pil_img,
+            image_meta,
+            width=w,
+            height=h,
+            page_width=float(page_width or 0),
+            page_height=float(page_height or 0),
+            is_image_primary=is_image_primary,
+        )
+    except Exception as meta_err:
+        print(f"/upscale_image: routing check failed ({meta_err}) — Lanczos")
 
     image_gen_provider = resolve_provider("IMAGE_GEN_PROVIDER", "auto")
-    use_kaggle_gen = (
-        decorative
-        and is_tiny_image(w, h)
-        and should_use_kaggle(image_gen_provider)
-    )
-    if decorative and not is_tiny_image(w, h):
-        print(f"/upscale_image: decorative but not tiny ({w}×{h} px) → Lanczos")
+    use_kaggle_gen = use_img2img and should_use_kaggle(image_gen_provider)
+    if use_img2img and not use_kaggle_gen:
+        print(f"/upscale_image: {route_reason} → img2img skipped (Kaggle off/unreachable)")
+    elif use_img2img:
+        print(f"/upscale_image: {route_reason} → Kaggle img2img ({w}×{h} px)")
+    elif route_reason == "informational":
+        print(f"/upscale_image: informational ({w}×{h} px) → Lanczos")
+    elif route_reason == "too_large":
+        print(f"/upscale_image: subject too large ({w}×{h} px) → Lanczos")
+
     if use_kaggle_gen:
-        print(f"/upscale_image: decorative tiny → Kaggle SDXL img2img ({w}×{h} px)")
         loop = asyncio.get_event_loop()
         try:
             gen_result = await loop.run_in_executor(
@@ -1346,8 +1350,8 @@ async def upscale_image(request: Request):
             )
             out_url = gen_result.get("image", "")
             if out_url:
-                method = gen_result.get("method", "sdxl_img2img")
-                print(f"/upscale_image: SDXL img2img output [{method}]")
+                method = gen_result.get("method", "ssd1b_img2img")
+                print(f"/upscale_image: img2img output [{method}]")
                 return {
                     "image": out_url,
                     "method": method,
@@ -1357,7 +1361,7 @@ async def upscale_image(request: Request):
         except Exception as gen_err:
             print(f"/upscale_image: Kaggle generate failed ({gen_err}) — Lanczos fallback")
 
-    print(f"/upscale_image: input {w}×{h} px (Lanczos), fmt={fmt}, decorative={decorative}")
+    print(f"/upscale_image: input {w}×{h} px (Lanczos), fmt={fmt}, route={route_reason}")
 
     loop = asyncio.get_event_loop()
     out_pil, method = await loop.run_in_executor(None, lambda: run_face_aware_upscale(pil_img))
