@@ -1,6 +1,47 @@
 import { isSarvamCreditsPayload } from '../lib/sarvamErrors'
 import API, { apiHeaders } from '../config/api'
 
+/** Session cache for /page_layout — dedupes parallel and repeat fetches per page. */
+const pageLayoutCache = new Map()
+const pageLayoutInflight = new Map()
+
+export function clearPageLayoutCache() {
+  pageLayoutCache.clear()
+  pageLayoutInflight.clear()
+}
+
+export async function fetchPageLayout(pageNumber) {
+  if (!pageNumber || pageNumber < 1) {
+    return null
+  }
+  if (pageLayoutCache.has(pageNumber)) {
+    return pageLayoutCache.get(pageNumber)
+  }
+  if (pageLayoutInflight.has(pageNumber)) {
+    return pageLayoutInflight.get(pageNumber)
+  }
+
+  const promise = (async () => {
+    try {
+      const response = await fetch(API.pageLayout(pageNumber), { headers: apiHeaders() })
+      if (!response.ok) {
+        return null
+      }
+      const data = await response.json()
+      pageLayoutCache.set(pageNumber, data)
+      return data
+    } catch (err) {
+      console.warn('Backend layout fetch failed:', err)
+      return null
+    } finally {
+      pageLayoutInflight.delete(pageNumber)
+    }
+  })()
+
+  pageLayoutInflight.set(pageNumber, promise)
+  return promise
+}
+
 function isPageNumber(str) {
   const trimmed = str.trim()
   return /^\d+$/.test(trimmed) || /^[ivx]+$/i.test(trimmed)
@@ -587,25 +628,11 @@ function mergeTOCEntries(entries) {
   })
 }
 
-async function getPageText(pdfDoc, pageNumber) {
+async function getPageTextFromPdfJs(pdfDoc, pageNumber) {
   if (!pageNumber || pageNumber < 1 || pageNumber > pdfDoc.numPages) {
     return ''
   }
 
-  // 1. Try backend layout parser first
-  try {
-    const LAYOUT_URL = API.pageLayout(pageNumber)
-    const response = await fetch(LAYOUT_URL, { headers: apiHeaders() })
-    if (response.ok) {
-      const data = await response.json()
-      const rawText = data.lines.map((line) => line.text).join(' ').replace(/\s+/g, ' ').trim()
-      return cleanSplitWords(rawText)
-    }
-  } catch (err) {
-    console.warn('Backend layout text extraction failed or unavailable. Falling back to frontend.', err)
-  }
-
-  // 2. Fallback to frontend PDF.js
   const page = await pdfDoc.getPage(pageNumber)
   const textContent = await page.getTextContent()
   const viewport = page.getViewport({ scale: 1.0 })
@@ -614,16 +641,16 @@ async function getPageText(pdfDoc, pageNumber) {
   const rawText = textContent.items
     .filter((item) => {
       if (isPageNumber(item.str)) {
-        return false // Exclude pure page numbers anywhere
+        return false
       }
       const y = item.transform[5]
       if (y > pageHeight * 0.91) {
-        return false // Exclude top headers
+        return false
       }
       if (y < pageHeight * 0.06) {
-        return false // Exclude footers
+        return false
       }
-      return true // Include body text
+      return true
     })
     .map((item) => item.str)
     .join(' ')
@@ -631,6 +658,20 @@ async function getPageText(pdfDoc, pageNumber) {
     .trim()
 
   return cleanSplitWords(rawText)
+}
+
+async function getPageText(pdfDoc, pageNumber) {
+  if (!pageNumber || pageNumber < 1 || pageNumber > pdfDoc.numPages) {
+    return ''
+  }
+
+  const data = await fetchPageLayout(pageNumber)
+  if (data?.lines) {
+    const rawText = data.lines.map((line) => line.text).join(' ').replace(/\s+/g, ' ').trim()
+    return cleanSplitWords(rawText)
+  }
+
+  return getPageTextFromPdfJs(pdfDoc, pageNumber)
 }
 
 function buildFallbackTOC(pdfDoc) {
@@ -657,7 +698,7 @@ async function detectPageOffset(pdfDoc, tocEntries) {
 
     for (const entry of sampleEntries) {
       const actualPage = entry.printedPage + offset
-      const pageText = normalizeText(await getPageText(pdfDoc, actualPage))
+      const pageText = normalizeText(await getPageTextFromPdfJs(pdfDoc, actualPage))
       const title = normalizeText(entry.title)
 
       if (!pageText || !title) {
@@ -1059,27 +1100,20 @@ export async function extractPagePresentation(pdfDoc, pageNumber, fallbackTitle 
   let pageHeight = 0
   let fetchedBackend = false
 
-  // 1. Try backend layout parser
-  try {
-    const LAYOUT_URL = API.pageLayout(pageNumber)
-    const response = await fetch(LAYOUT_URL, { headers: apiHeaders() })
-    if (response.ok) {
-      const data = await response.json()
-      lines = prepareLayoutLines(data.lines)
-      const rawSourceText = lines.map((line) => line.text).join(' ').replace(/\s+/g, ' ').trim()
-      sourceText = cleanSplitWords(rawSourceText)
-      analyzeText = buildStructuredAnalyzeText(lines, {
-        isCallout: detectCalloutPage(lines),
-      })
-      pageLayout = detectCalloutPage(lines) ? 'qa' : 'structured'
-      pageWidth = data.width || 0
-      pageHeight = data.height || 0
-      imagesData = data.images || []
-      images = data.images.map((img) => img.url)
-      fetchedBackend = true
-    }
-  } catch (err) {
-    console.warn('Backend layout analysis failed or unavailable. Falling back to frontend-only parsing.', err)
+  const layoutData = await fetchPageLayout(pageNumber)
+  if (layoutData?.lines) {
+    lines = prepareLayoutLines(layoutData.lines)
+    const rawSourceText = lines.map((line) => line.text).join(' ').replace(/\s+/g, ' ').trim()
+    sourceText = cleanSplitWords(rawSourceText)
+    analyzeText = buildStructuredAnalyzeText(lines, {
+      isCallout: detectCalloutPage(lines),
+    })
+    pageLayout = detectCalloutPage(lines) ? 'qa' : 'structured'
+    pageWidth = layoutData.width || 0
+    pageHeight = layoutData.height || 0
+    imagesData = layoutData.images || []
+    images = (layoutData.images || []).map((img) => img.url)
+    fetchedBackend = true
   }
 
   // 2. Fallback to frontend-only if backend failed

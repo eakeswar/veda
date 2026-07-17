@@ -1,6 +1,6 @@
 import { useState } from "react"
 import { usePDF } from "../context/PDFContext"
-import { extractTOC } from "../utils/pdfUtils"
+import { clearPageLayoutCache, extractTOC } from "../utils/pdfUtils"
 import { cn } from "../lib/cn"
 import API, { apiHeaders } from "../config/api"
 
@@ -44,6 +44,7 @@ export default function LeftPanel({ isOpen, onToggle }) {
         console.warn('Backend PDF upload unavailable:', uploadErr)
       }
       const pdfDoc = await pdfjsLib.getDocument({ data: arrayBuffer }).promise
+      clearPageLayoutCache()
       dispatch({ type: "SET_PDF", payload: pdfDoc })
       const { toc, offset } = await extractTOC(pdfDoc)
       dispatch({ type: "SET_TOC", payload: toc })

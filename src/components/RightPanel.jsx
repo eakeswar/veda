@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { usePDF, notifySarvamCreditsExhausted } from '../context/PDFContext'
-import { extractPagePresentation, extractPageText, fetchSemanticAnalysis, fetchTeluguDeck, fetchTranslatedFields, upscaleImages } from '../utils/pdfUtils'
+import { extractPagePresentation, fetchSemanticAnalysis, fetchTeluguDeck, fetchTranslatedFields, upscaleImages } from '../utils/pdfUtils'
 import { requestCloudTTS, requestCloudTTSBoundaries, getTTSStreamUrl, supportsCloudTTS } from '../utils/speechUtils'
 import { cn } from '../lib/cn'
 import AIAvatar from './AIAvatar'
@@ -239,20 +239,62 @@ function getSpeechText(deck, language, pageText, digestTopicIndex = 0) {
 }
 
 
-function OriginalPageModal({ isOpen, onClose, canvasRef }) {
+function OriginalPageModal({ isOpen, onClose, pdfDoc, pageNumber }) {
+  const canvasRef = useRef(null)
+  const renderTaskRef = useRef(null)
   const [dataUrl, setDataUrl] = useState('')
 
   useEffect(() => {
-    if (isOpen && canvasRef.current) {
-      try {
-        setDataUrl(canvasRef.current.toDataURL('image/png'))
-      } catch (err) {
-        console.error('Error generating page data URL:', err)
-      }
-    } else {
+    if (!isOpen || !pdfDoc || !pageNumber) {
       setDataUrl('')
+      return undefined
     }
-  }, [isOpen, canvasRef])
+
+    let isCancelled = false
+
+    async function renderPage() {
+      try {
+        if (renderTaskRef.current) {
+          renderTaskRef.current.cancel()
+          renderTaskRef.current = null
+        }
+
+        const page = await pdfDoc.getPage(pageNumber)
+        const canvas = canvasRef.current
+        if (!canvas || isCancelled) {
+          return
+        }
+
+        const viewport = page.getViewport({ scale: 1.45 })
+        canvas.width = viewport.width
+        canvas.height = viewport.height
+
+        const context = canvas.getContext('2d')
+        const renderTask = page.render({ canvasContext: context, viewport })
+        renderTaskRef.current = renderTask
+        await renderTask.promise
+        renderTaskRef.current = null
+
+        if (!isCancelled && canvasRef.current) {
+          setDataUrl(canvasRef.current.toDataURL('image/png'))
+        }
+      } catch (err) {
+        if (err?.name !== 'RenderingCancelledException') {
+          console.error('Error rendering original page:', err)
+        }
+      }
+    }
+
+    renderPage()
+
+    return () => {
+      isCancelled = true
+      if (renderTaskRef.current) {
+        renderTaskRef.current.cancel()
+        renderTaskRef.current = null
+      }
+    }
+  }, [isOpen, pdfDoc, pageNumber])
 
   if (!isOpen) return null
 
@@ -286,6 +328,7 @@ function OriginalPageModal({ isOpen, onClose, canvasRef }) {
             <p className="text-veda-muted p-8">Rendering high-res page...</p>
           )}
         </div>
+        <canvas ref={canvasRef} className="hidden" aria-hidden="true" />
       </div>
     </div>
   )
@@ -386,8 +429,6 @@ export default function RightPanel({ sidebarOpen, onToggleSidebar }) {
       notifySarvamCreditsExhausted(dispatch)
     }
   }, [dispatch])
-  const renderCanvasRef = useRef(null)
-  const renderTaskRef = useRef(null)
   const audioRef = useRef(null)
   const objectUrlRef = useRef(null)
   const cloudWordBoundariesRef = useRef([])
@@ -894,7 +935,7 @@ export default function RightPanel({ sidebarOpen, onToggleSidebar }) {
       return undefined
     }
 
-    // Return cached page deck instantly if analysis or Telugu translation is complete
+    // Return cached page deck instantly if analysis, translation, or heuristic is ready
     const cacheKey = `${state.selectedPage}_${state.language}`
     const cachedDeck = pageCacheRef.current[cacheKey]
     if (cachedDeck?.isSemantic || cachedDeck?.isTelugu) {
@@ -907,6 +948,108 @@ export default function RightPanel({ sidebarOpen, onToggleSidebar }) {
       setPendingSemanticDeck(null)
       setActiveBoundaries([])
       return undefined
+    }
+
+    if (cachedDeck?.isHeuristic) {
+      handleStop()
+      dispatch({ type: 'SET_PAGE_TEXT', payload: cachedDeck.sourceText || '' })
+      pageDeckPageRef.current = state.selectedPage
+      setPageDeck(applyUpscaledImages(cachedDeck, upscaledUrlMapRef.current))
+      setIsPreparing(false)
+      setActiveBoundaries([])
+      setPendingSemanticDeck(null)
+
+      let isCancelled = false
+      const showImmediately = state.language !== 'te-IN'
+
+      function startUpscalingFromCache(targetDeck) {
+        const rawImages = [
+          ...(targetDeck.images || []),
+          ...(targetDeck.topics || []).map((t) => t.image).filter(Boolean),
+        ]
+        const toUpscale = [...new Set(rawImages.filter(Boolean))]
+          .filter((u) => !upscaledUrlMapRef.current[u])
+        if (toUpscale.length === 0) return
+        const pageWordCount = (targetDeck.sourceText || '')
+          .trim()
+          .split(/\s+/)
+          .filter(Boolean).length
+        upscaleImages(toUpscale, {
+          pageText: targetDeck.sourceText || '',
+          pageWidth: targetDeck.pageWidth || 0,
+          pageHeight: targetDeck.pageHeight || 0,
+          pageWordCount,
+          isImagePrimary: !!targetDeck.isImagePrimary,
+          imagesMeta: targetDeck.imagesMeta || [],
+        })
+          .then((upscaled) => {
+            if (isCancelled) return
+            const urlMap = Object.fromEntries(toUpscale.map((u, i) => [u, upscaled[i]]))
+            upscaledUrlMapRef.current = { ...upscaledUrlMapRef.current, ...urlMap }
+            setPageDeck((prev) => applyUpscaledImages(prev, urlMap))
+            setPageCache((prev) => patchPageCacheUpscaled(prev, state.selectedPage, urlMap))
+          })
+          .catch(() => {})
+      }
+
+      startUpscalingFromCache(cachedDeck)
+      setIsAnalyzing(true)
+      fetchSemanticAnalysis(cachedDeck.sourceText, cachedDeck.title, cachedDeck.isDigest, state.language, {
+        onSarvamCreditsExhausted,
+        structuredText: cachedDeck.analyzeText,
+        pageLayout: cachedDeck.pageLayout,
+      })
+        .then(async (semanticData) => {
+          if (isCancelled) return
+
+          let finalDeck = null
+          if (semanticData) {
+            finalDeck = mergeSemanticDeck(cachedDeck, semanticData)
+          } else if (state.language === 'te-IN') {
+            finalDeck = await fetchTeluguDeck(cachedDeck, { onSarvamCreditsExhausted })
+          }
+
+          setIsAnalyzing(false)
+          if (!finalDeck || isCancelled) return
+
+          startUpscalingFromCache(finalDeck)
+          finalDeck = applyUpscaledImages(finalDeck, upscaledUrlMapRef.current)
+
+          if (!showImmediately) {
+            pageDeckPageRef.current = state.selectedPage
+            setIsPreparing(false)
+          }
+
+          setPageCache((prev) => ({ ...prev, [cacheKey]: finalDeck }))
+
+          if (ttsStateRef.current === 'idle') {
+            setPageDeck(finalDeck)
+          } else {
+            setPendingSemanticDeck(finalDeck)
+          }
+
+          if (state.language === 'te-IN') {
+            fetchTranslatedFields(finalDeck, ['highlights', 'supportingPoints'], state.language)
+              .then((enriched) => {
+                if (!enriched || isCancelled) return
+                const withUpscaledImages = applyUpscaledImages(
+                  enriched,
+                  upscaledUrlMapRef.current
+                )
+                setPageDeck(withUpscaledImages)
+                setPageCache((prev) => ({ ...prev, [cacheKey]: withUpscaledImages }))
+              })
+              .catch(() => {})
+          }
+        })
+        .catch((err) => {
+          console.error('Background analysis error:', err)
+          setIsAnalyzing(false)
+        })
+
+      return () => {
+        isCancelled = true
+      }
     }
 
     // Fast path: translate existing deck to Telugu (works even when local LLM is unavailable)
@@ -967,51 +1110,23 @@ export default function RightPanel({ sidebarOpen, onToggleSidebar }) {
       handleStop()
 
       try {
-        const page = await state.pdfDoc.getPage(state.selectedPage)
-        const canvas = renderCanvasRef.current
-
-        if (!canvas || isCancelled) {
-          return
-        }
-
-        // Cancel any in-progress render task before starting a new one
-        if (renderTaskRef.current) {
-          renderTaskRef.current.cancel()
-          renderTaskRef.current = null
-        }
-
-        const viewport = page.getViewport({ scale: 1.45 })
-        canvas.width = viewport.width
-        canvas.height = viewport.height
-
-        const context = canvas.getContext('2d')
-        const renderTask = page.render({ canvasContext: context, viewport })
-        renderTaskRef.current = renderTask
-        try {
-          await renderTask.promise
-        } catch (renderErr) {
-          // RenderingCancelledException is expected when we cancel mid-render — ignore it
-          if (renderErr?.name === 'RenderingCancelledException') return
-          throw renderErr
-        }
-        renderTaskRef.current = null
-
-        if (isCancelled) {
-          return
-        }
-
-        const pageText = await extractPageText(state.pdfDoc, state.selectedPage)
         const deck = await extractPagePresentation(
           state.pdfDoc,
           state.selectedPage,
           selectedEntry?.title || `Page ${state.selectedPage}`
         )
 
-        if (isCancelled) {
+        if (isCancelled || !deck) {
           return
         }
 
-        dispatch({ type: 'SET_PAGE_TEXT', payload: pageText })
+        dispatch({ type: 'SET_PAGE_TEXT', payload: deck.sourceText || '' })
+
+        const heuristicCacheKey = `${state.selectedPage}_${state.language}`
+        setPageCache((prev) => ({
+          ...prev,
+          [heuristicCacheKey]: { ...deck, isHeuristic: true },
+        }))
 
         // Helper: start upscaling for a deck's images, store results in upscaledUrlMapRef
         // so any subsequent deck swap on the same page can immediately use cached results.
@@ -1135,12 +1250,8 @@ export default function RightPanel({ sidebarOpen, onToggleSidebar }) {
 
     return () => {
       isCancelled = true
-      if (renderTaskRef.current) {
-        renderTaskRef.current.cancel()
-        renderTaskRef.current = null
-      }
     }
-  }, [dispatch, selectedEntry?.title, state.pdfDoc, state.selectedPage, state.language, handleStop])
+  }, [dispatch, selectedEntry?.title, state.pdfDoc, state.selectedPage, state.language, handleStop, onSarvamCreditsExhausted])
 
   function handleLanguageChange(language) {
     dispatch({ type: 'SET_LANGUAGE', payload: language })
@@ -1321,10 +1432,12 @@ export default function RightPanel({ sidebarOpen, onToggleSidebar }) {
 
   return (
     <div className="relative flex flex-col flex-1 h-screen overflow-hidden bg-veda-surface dark:bg-veda-surface-dark transition-colors duration-300">
-      <canvas ref={renderCanvasRef} className="hidden" />
-
-      {/* Original PDF Page modal overlay */}
-      <OriginalPageModal isOpen={isOriginalModalOpen} onClose={() => setIsOriginalModalOpen(false)} canvasRef={renderCanvasRef} />
+      <OriginalPageModal
+        isOpen={isOriginalModalOpen}
+        onClose={() => setIsOriginalModalOpen(false)}
+        pdfDoc={state.pdfDoc}
+        pageNumber={state.selectedPage}
+      />
 
       {/* Enlarged Image modal overlay */}
       <EnlargedImageModal imageUrl={enlargedImage} title={enlargedTitle} onClose={() => setEnlargedImage(null)} />
