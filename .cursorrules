@@ -57,6 +57,7 @@ veda/
       PDFContext.jsx      ← useReducer + Context API; syncs theme to `<html data-theme>`
     utils/
       pdfUtils.js         ← PDF.js utilities, page analysis, image extraction
+      exportPageHtml.js   ← Trial per-page HTML export (open in new tab)
       speechUtils.js      ← Speech/audio utilities
   index.html              ← Loads Inter, Outfit, and Noto Sans Telugu from Google Fonts
 ```
@@ -141,6 +142,7 @@ before restarting the backend. `load_dotenv(..., override=True)` so `.env` wins 
 - `IndicTransState` — singleton for NLLB-200-1.3B (local fallback translation)
 - `PDFMetadataAnalyzer` — in `page_layout_service.py`; header/footer detection
 - `extract_page_layout()` — in `page_layout_service.py`; shared by laptop + Kaggle
+- `_is_background_image()` / `merge_background_images()` — in `page_layout_service.py`; full-page bg tag + Kaggle enrich
 - `upscale_image()` — in `upscale_service.py`; Lanczos-only, laptop only
 - `build_analyze_messages()` / `extract_analysis_json()` — in `analyze_prompts.py`
 - `run_semantic_analysis()` — routes `/analyze` to Kaggle or `analyze_text_semantic_local()`
@@ -200,6 +202,7 @@ when `IMAGE_GEN_PROVIDER=auto|kaggle` and Kaggle is reachable; any failure silen
 #### Laptop routing (`tts_server.py` `/upscale_image`) — Phase 1 subject routing (Jul 16 2026)
 - `should_route_img2img()` in `decorative_image.py` — **laptop-only**; Kaggle only sees `/generate_image` when this returns True
 - **Informational** (charts, screenshots, high `overlapWordCount`) → Lanczos always
+- **Background** (`isBackground: true` on image meta) → Lanczos always; no img2img, no frontend upscale
 - **People** (YuNet face detect; HOG optional — may fail on OpenCV 5) → Kaggle img2img up to `IMAGE_GEN_MAX_DIM` (default 1024)
 - **Photo-like decorative + tiny** (`w < 400` or `h < 400`, low overlap) → Kaggle img2img
 - **Too large** (max side > `IMAGE_GEN_MAX_DIM`) or default → Lanczos
@@ -246,9 +249,13 @@ when `IMAGE_GEN_PROVIDER=auto|kaggle` and Kaggle is reachable; any failure silen
   - Background-like images (>85% page dim or >45% page area) excluded from overlap filter
   - Header/footer filtering via `PDFMetadataAnalyzer`
 - **Images**: PyMuPDF `get_images(full=True)` + `get_image_rects(xref)`
-  - Filters: skip w/h < 5, skip w/h < 50 (icons), skip w > 90% page width (backgrounds)
+  - Filters: skip w/h < 5, skip w/h < 50 (icons)
+  - **Backgrounds extracted** with `isBackground: true` (width >90%, both dims >85%, or area >45% of page)
+  - Toggle: `EXTRACT_BACKGROUND_IMAGES=1` (default on; set `0` to skip backgrounds like pre-Jul 21)
   - Each image includes `overlapWordCount` (words overlapping image zone via pdfplumber)
-- When `LAYOUT_PROVIDER=kaggle`: PDF mirrored to Kaggle on upload; layout fetched from tunnel
+  - `_content_image_rects()` still excludes backgrounds from text overlap filtering
+- When `LAYOUT_PROVIDER=kaggle`: PDF mirrored to Kaggle on upload; layout fetched from tunnel;
+  laptop **merges local backgrounds** into Kaggle response via `merge_background_images()` until bundle is republished
 
 ### Phase 1 magazine layout (Jul 8 2026) — frontend + LLM input
 Raw `/page_layout` lines are post-processed in `pdfUtils.js` before slide build and `/analyze`:
@@ -289,6 +296,7 @@ Raw `/page_layout` lines are post-processed in `pdfUtils.js` before slide build 
 20. **img2img never reached Kaggle** (Jul 16 bug): `kaggle_generate_image()` was nested under `too_large` branch — fixed; watch laptop logs not notebook layout log alone
 21. **YuNet concurrent crash** on parallel `/upscale_image` — fixed with `_face_detect_lock` in `upscale_service.py`
 22. **Dark mode toggle broken** (Jul 16): `data-theme` was on inner div; body CSS inverted — fixed via `html[data-theme]` sync in `PDFContext.jsx`
+23. **Full-page backgrounds missing** (Jul 21): old extractor skipped w >90% page width — cover pages had 0 images; fixed with `isBackground` tag + laptop Kaggle merge
 
 ---
 
@@ -309,9 +317,19 @@ Raw `/page_layout` lines are post-processed in `pdfUtils.js` before slide build 
 - Telugu text uses line-height: 1.75 and letter-spacing: 0 for legibility
 
 ### Key Components
-- `RightPanel.jsx` — handles slide rendering, karaoke highlighting, audio playback, language toggle
+- `RightPanel.jsx` — slide rendering, karaoke, audio playback, language toggle, **Open HTML** export button
 - `LeftPanel.jsx` — TOC sidebar, PDF upload trigger
 - `AIAvatar.jsx` — currently a static animated SVG/CSS avatar (Veda robot), to be replaced by Zoro video
+
+### HTML Export (Jul 21 2026 — trial, frontend-only)
+- `exportPageHtml.js` — `openPageHtml()` builds self-contained HTML and opens in a **new browser tab** (not download)
+- Trigger: **Open HTML** button in `RightPanel.jsx` (uses current `pageDeck` + cached `audioCache`)
+- Layout: Medium/Substack-style — centered column, Outfit headline, Lora body, sticky nav, light/dark toggle
+- **Normal pages:** title, subtitle, summary, hero image, article body (narration/summary/source), “At a glance”
+  highlights, listen/karaoke block (if narration was played/cached), supporting points, optional PDF excerpt
+- **Digest pages:** intro, gallery strip, stacked story sections, takeaways + notes at end
+- Audio/karaoke embedded only when TTS was already cached in-session (no batch TTS on export yet)
+- **Not yet built:** export all pages / whole PDF; download option; batch TTS for digest stories on export
 
 ### PDF Processing Flow
 1. User uploads PDF in LeftPanel
@@ -323,6 +341,7 @@ Raw `/page_layout` lines are post-processed in `pdfUtils.js` before slide build 
 7. Telugu: translation via Kaggle/local NLLB (`/analyze`, `/translate_deck`, `/translate_fields`)
 8. On play: POST /tts → Sarvam audio + STT boundaries (edge-tts fallback)
 9. Images: POST /upscale_image — Phase 1 subject routing → Kaggle SSD-1B img2img or Lanczos on laptop
+10. Optional: **Open HTML** — client-side export of current page to new tab (`exportPageHtml.js`)
 
 ### Digest Pages
 - Pages with 3+ distinct articles are detected as "digest" pages
@@ -331,6 +350,7 @@ Raw `/page_layout` lines are post-processed in `pdfUtils.js` before slide build 
 - Each story is then shown in a carousel (Story 1, Story 2, …) below the image strip
 - Image matching (matchImagesToTopicsGlobal) uses vertical zone assignment:
   each topic owns the vertical band between its heading and the next heading
+- **Foreground only:** digest matching uses `foregroundLayoutImages()` — backgrounds excluded from topic match + strip
 - **LLM digest prompts (Jul 16):** per-topic summary 40–55 words (2 sentences); narration 80–100 words (`analyze_prompts.py`)
 - **Heuristic digest body:** 4 sentences from PDF (`pdfUtils.js`); `mergeDigestTopicBody()` in `RightPanel.jsx` merges LLM summary + extra PDF sentences
 
@@ -338,6 +358,9 @@ Raw `/page_layout` lines are post-processed in `pdfUtils.js` before slide build 
 - Pages with images but < 50 words (covers, ads, photo spreads) bypass topic detection and LLM
 - Returned immediately as `isImagePrimary: true` slide with the image as the main visual
 - LLM skip threshold in fetchSemanticAnalysis also set to 50 words (was 30)
+- **`pickDisplayImages()`** — foreground inset images for carousels; if none, largest `isBackground` image (covers)
+- **`foregroundLayoutImages()`** — filters out `isBackground` for digest matching and normal carousels
+- **`upscaleImages()`** skips upscale for `isBackground` images (already full-page resolution)
 
 ### Heading Detection (detectTopics in pdfUtils.js)
 - Uses font-size gap clustering: finds the largest jump between consecutive unique font sizes
@@ -399,6 +422,7 @@ IMAGE_GEN_PROVIDER=auto        # auto|kaggle|local — decorative SDXL routing (
 # SDXL_STRENGTH=0.35           # img2img denoising (0.25–0.45 faithful)
 # SDXL_MODEL=segmind/SSD-1B      # default img2img (~3 GB); override: stabilityai/stable-diffusion-xl-base-1.0
 # IMAGE_GEN_MAX_DIM=1024       # max side for img2img routing (people + photo_tiny)
+# EXTRACT_BACKGROUND_IMAGES=1  # extract full-page PDF backgrounds with isBackground tag (default on)
 
 # Kaggle official API — publish project-models from laptop
 KAGGLE_USERNAME=your_username
@@ -434,6 +458,23 @@ over stale shell environment variables.
 5. **SDXL img2img** — DONE (Jul 14 2026): faithful enhancement from original pixels
 6. **Sequential pre-warm + HF_TOKEN** — DONE (Jul 14 2026): avoids Cloudflare 524 on first load
 7. **Disk cache for generated images** — partial (Jul 15): frontend `pageCache`/`upscaledUrlMapRef`; TODO: server disk cache by image hash
+8. **HTML export enhancements** — batch TTS on export; export all visited pages / whole PDF; download option
+9. **SVG/CSS blur treatment** — optional presentation layer for soft/tiny images (discussed Jul 21; not built)
+
+## Background Image Extraction — DONE (Jul 21 2026)
+- `page_layout_service.py`: `_is_background_image()`, extract with `isBackground: true` (was skipped at w >90%)
+- `EXTRACT_BACKGROUND_IMAGES=1` env toggle (default on)
+- `merge_background_images()` — laptop enriches Kaggle `/page_layout` with local backgrounds until bundle republished
+- `decorative_image.should_route_img2img()` — backgrounds → Lanczos (`reason: background`)
+- `tts_server.py`: Kaggle layout path calls merge; logs `background → Lanczos`
+- `pdfUtils.js`: `pickDisplayImages()`, `foregroundLayoutImages()`; digest uses foreground only; skip upscale for backgrounds
+- Cover/image-primary pages (e.g. Discovery p.1, 4, 13) now show full-page art
+
+## HTML Page Export — DONE (Jul 21 2026)
+- `src/utils/exportPageHtml.js` — `openPageHtml()` self-contained per-page HTML preview
+- `RightPanel.jsx` — **Open HTML** button opens new tab (not file download)
+- Medium/Substack-style reading layout with rich body content, digest support, optional cached audio/karaoke
+- Frontend-only; no backend/Kaggle changes required
 
 ## Telugu Upscale Persistence — DONE (Jul 15 2026)
 - `RightPanel.jsx`: `applyUpscaledImages`, `patchPageCacheUpscaled`, `upscaledUrlMapRef` (per-page, survives EN↔TE)
