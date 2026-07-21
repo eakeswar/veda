@@ -122,10 +122,12 @@ def should_route_img2img(
       • else → Lanczos
     Returns (use_img2img, reason_tag).
     """
+    meta = image_meta or {}
+    if meta.get("isBackground"):
+        return False, "background"
+
     if not _within_img2img_size(width, height):
         return False, "too_large"
-
-    meta = image_meta or {}
     if page_width and page_height and is_informational_image(
         meta, page_width=page_width, page_height=page_height
     ):

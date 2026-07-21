@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import os
 import re
 
 import fitz
@@ -166,6 +167,41 @@ def _attach_overlap_word_counts(
             img["overlapWordCount"] = _words_overlapping_image_count(words, *td)
     except Exception as exc:
         print(f"overlapWordCount skipped for page {page_num} ({exc})")
+
+
+def _extract_background_images_enabled() -> bool:
+    return os.environ.get("EXTRACT_BACKGROUND_IMAGES", "1").strip().lower() in ("1", "true", "yes")
+
+
+def _is_background_image(img_w: float, img_h: float, page_w: float, page_h: float) -> bool:
+    """Full-page or near-full-page decorative backgrounds — not inset figures."""
+    if page_w <= 0 or page_h <= 0:
+        return False
+    if img_w > page_w * 0.90:
+        return True
+    if img_w > page_w * 0.85 and img_h > page_h * 0.85:
+        return True
+    if img_w * img_h > page_w * page_h * 0.45:
+        return True
+    return False
+
+
+def merge_background_images(remote_images: list, local_images: list) -> list:
+    """Append local background images missing from remote layout (e.g. stale Kaggle bundle)."""
+    merged = list(remote_images or [])
+    existing = {
+        (round(i.get("x", 0)), round(i.get("y", 0)), round(i.get("w", 0)), round(i.get("h", 0)))
+        for i in merged
+    }
+    for img in local_images or []:
+        if not img.get("isBackground"):
+            continue
+        key = (round(img.get("x", 0)), round(img.get("y", 0)), round(img.get("w", 0)), round(img.get("h", 0)))
+        if key in existing:
+            continue
+        merged.append(img)
+        existing.add(key)
+    return merged
 
 
 def _content_image_rects(img_rects_topdown, width, height):
@@ -400,8 +436,8 @@ def extract_page_layout(
             # Skip tiny decorative elements (icons, bullets, dividers)
             if img_w < 50 or img_h < 50:
                 continue
-            # Skip full-page-width backgrounds / decorative banners
-            if img_w > width * 0.90:
+            is_bg = _is_background_image(img_w, img_h, width, height)
+            if is_bg and not _extract_background_images_enabled():
                 continue
 
             try:
@@ -422,7 +458,8 @@ def extract_page_layout(
                 "w": img_w,
                 "h": img_h,
                 "cx": (rect.x0 + rect.x1) / 2,
-                "cy": height - (rect.y0 + rect.y1) / 2
+                "cy": height - (rect.y0 + rect.y1) / 2,
+                "isBackground": is_bg,
             })
             break  # one rect per xref is enough for position info
 

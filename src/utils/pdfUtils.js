@@ -1085,6 +1085,22 @@ function prepareLayoutLines(rawLines) {
   return lines
 }
 
+/** Inset figures only — excludes full-page PDF backgrounds. */
+function foregroundLayoutImages(imagesData) {
+  return (imagesData || []).filter((img) => !img.isBackground)
+}
+
+/** Foreground images for carousels; fall back to largest background on cover pages. */
+function pickDisplayImages(imagesData) {
+  const foreground = foregroundLayoutImages(imagesData)
+  if (foreground.length) return foreground
+  const backgrounds = (imagesData || []).filter((img) => img.isBackground)
+  if (!backgrounds.length) return []
+  return [...backgrounds].sort(
+    (a, b) => (b.w || 0) * (b.h || 0) - (a.w || 0) * (a.h || 0)
+  )
+}
+
 export async function extractPagePresentation(pdfDoc, pageNumber, fallbackTitle = '') {
   if (!pageNumber || pageNumber < 1 || pageNumber > pdfDoc.numPages) {
     return null
@@ -1112,7 +1128,7 @@ export async function extractPagePresentation(pdfDoc, pageNumber, fallbackTitle 
     pageWidth = layoutData.width || 0
     pageHeight = layoutData.height || 0
     imagesData = layoutData.images || []
-    images = (layoutData.images || []).map((img) => img.url)
+    images = pickDisplayImages(imagesData).map((img) => img.url)
     fetchedBackend = true
   }
 
@@ -1152,7 +1168,8 @@ export async function extractPagePresentation(pdfDoc, pageNumber, fallbackTitle 
   // Cover pages, full-page ads, photo spreads. Skip LLM; build a minimal slide
   // that leads with the image.
   const wordCount = sourceText.trim().split(/\s+/).filter(Boolean).length
-  if (images.length > 0 && wordCount < 50) {
+  if ((imagesData || []).length > 0 && wordCount < 50) {
+    images = pickDisplayImages(imagesData).map((img) => img.url)
     const title = buildTitle(lines, fallbackTitle) || fallbackTitle || 'Visual'
     return {
       isDigest: false,
@@ -1183,8 +1200,8 @@ export async function extractPagePresentation(pdfDoc, pageNumber, fallbackTitle 
     const supportingPoints = topics.flatMap((t) => t.sentences.slice(0, 2))
     const summary = intro || `A roundup of ${topics.length} stories on this page.`
 
-    // Match each topic to the closest image using spatial weighted global permutation optimizer
-    const matchedImages = matchImagesToTopicsGlobal(topics, imagesData)
+    // Match each topic to inset figures only — skip full-page backgrounds
+    const matchedImages = matchImagesToTopicsGlobal(topics, foregroundLayoutImages(imagesData))
 
     return {
       isDigest: true,
@@ -1382,6 +1399,8 @@ export async function upscaleImages(imageUrls, context = {}) {
   const results = await Promise.all(
     imageUrls.map(async (url) => {
       if (!url || !url.startsWith('data:image')) return url
+      const meta = metaByUrl[url]
+      if (meta?.isBackground) return url
       try {
         const fmt = url.startsWith('data:image/jpeg') ? 'jpeg' : 'png'
         const resp = await fetch(API.upscale, {
@@ -1395,7 +1414,7 @@ export async function upscaleImages(imageUrls, context = {}) {
             page_height: pageHeight,
             page_word_count: pageWordCount,
             is_image_primary: isImagePrimary,
-            image_meta: metaByUrl[url] || null,
+            image_meta: meta || null,
           }),
         })
         if (!resp.ok) return url

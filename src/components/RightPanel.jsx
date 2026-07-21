@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { usePDF, notifySarvamCreditsExhausted } from '../context/PDFContext'
 import { extractPagePresentation, fetchSemanticAnalysis, fetchTeluguDeck, fetchTranslatedFields, upscaleImages } from '../utils/pdfUtils'
+import { openPageHtml } from '../utils/exportPageHtml'
 import { requestCloudTTS, requestCloudTTSBoundaries, getTTSStreamUrl, supportsCloudTTS } from '../utils/speechUtils'
 import { cn } from '../lib/cn'
 import AIAvatar from './AIAvatar'
@@ -475,6 +476,7 @@ export default function RightPanel({ sidebarOpen, onToggleSidebar }) {
   const [selectedVoice, setSelectedVoice] = useState('en-US-AriaNeural')
   const [activeImageIndex, setActiveImageIndex] = useState(0)
   const [digestTopicIndex, setDigestTopicIndex] = useState(0)
+  const [isExportingHtml, setIsExportingHtml] = useState(false)
   const autoPlayAfterPreloadRef = useRef(false)
 
   const pageDeckRef = useRef(pageDeck)
@@ -1425,6 +1427,46 @@ export default function RightPanel({ sidebarOpen, onToggleSidebar }) {
   }
 
 
+  const handleExportHtml = useCallback(async () => {
+    if (!pageDeck || isPreparing || isExportingHtml) {
+      return
+    }
+
+    setIsExportingHtml(true)
+    setCloudMessage('Opening HTML preview…')
+    try {
+      const pdfLabel = state.pageOffset && state.selectedPage - state.pageOffset > 0
+        ? `Page ${state.selectedPage - state.pageOffset}`
+        : `Page ${state.selectedPage}`
+
+      await openPageHtml(pageDeck, {
+        pageNumber: state.selectedPage,
+        pageLabel: pageDeck.title || selectedEntry?.title || pdfLabel,
+        language: state.language,
+        theme: state.theme,
+        sourceText: state.pageText,
+        cachedAudio: audioCache[state.selectedPage] || null,
+      })
+      setCloudMessage('HTML preview opened in new tab')
+    } catch (error) {
+      console.error('HTML export failed:', error)
+      setCloudMessage(error?.message || 'HTML preview failed')
+    } finally {
+      setIsExportingHtml(false)
+    }
+  }, [
+    audioCache,
+    isExportingHtml,
+    isPreparing,
+    pageDeck,
+    selectedEntry?.title,
+    state.language,
+    state.pageOffset,
+    state.pageText,
+    state.selectedPage,
+    state.theme,
+  ])
+
   // Accent color for SVG arrows in legacy inline spots
   const isPlayPrimary = state.ttsState !== 'speaking'
   const isPauseActive = state.ttsState === 'speaking'
@@ -1508,6 +1550,19 @@ export default function RightPanel({ sidebarOpen, onToggleSidebar }) {
               </button>
             </div>
           )}
+
+          <button
+            onClick={handleExportHtml}
+            disabled={!pageDeck || isPreparing || isExportingHtml}
+            className="glass-btn px-3 h-[34px] rounded-full text-[0.72rem] font-bold shrink-0
+              bg-white/45 text-veda-text border border-black/5 shadow-sm
+              hover:bg-white/65 hover:border-black/10 disabled:opacity-45 disabled:cursor-not-allowed
+              dark:bg-white/5 dark:text-[#cfc6b1] dark:border-white/10 dark:shadow-md
+              dark:hover:bg-white/10 dark:hover:border-white/20"
+            title="Open this page as a standalone HTML preview"
+          >
+            {isExportingHtml ? 'Opening…' : 'Open HTML'}
+          </button>
 
           {/* Sun/Moon Theme Switcher */}
           <button

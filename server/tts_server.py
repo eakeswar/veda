@@ -41,7 +41,7 @@ from kaggle_client import (
     resolve_provider,
     should_use_kaggle,
 )
-from page_layout_service import PDFMetadataAnalyzer, extract_page_layout
+from page_layout_service import PDFMetadataAnalyzer, extract_page_layout, merge_background_images
 from qwen_config import get_local_qwen_gguf_info
 from security import (
     MAX_ANALYZE_TEXT_CHARS,
@@ -1150,7 +1150,32 @@ def get_page_layout(page: int):
     if should_use_kaggle(layout_provider):
         try:
             print(f"GET /page_layout?page={page} via Kaggle …")
-            return kaggle_page_layout(page)
+            result = kaggle_page_layout(page)
+            try:
+                if active_doc is None:
+                    pdf_path = BASE_DIR / "active_doc.pdf"
+                    if pdf_path.exists():
+                        with active_doc_lock:
+                            if active_doc is None:
+                                active_doc = fitz.open(str(pdf_path))
+                                active_analyzer = PDFMetadataAnalyzer(active_doc)
+                if active_doc is not None:
+                    if active_analyzer is None:
+                        active_analyzer = PDFMetadataAnalyzer(active_doc)
+                    with active_doc_lock:
+                        local = extract_page_layout(
+                            active_doc,
+                            active_analyzer,
+                            page,
+                            pdfplumber_available=_PDFPLUMBER_AVAILABLE,
+                        )
+                    result["images"] = merge_background_images(
+                        result.get("images") or [],
+                        local.get("images") or [],
+                    )
+            except Exception as enrich_err:
+                print(f"Background merge skipped for page {page} ({enrich_err})")
+            return result
         except Exception as kaggle_err:
             if layout_provider == "kaggle":
                 raise HTTPException(status_code=502, detail=str(kaggle_err)) from kaggle_err
@@ -1338,6 +1363,8 @@ async def upscale_image(request: Request):
         print(f"/upscale_image: {route_reason} → Kaggle img2img ({w}×{h} px)")
     elif route_reason == "informational":
         print(f"/upscale_image: informational ({w}×{h} px) → Lanczos")
+    elif route_reason == "background":
+        print(f"/upscale_image: background ({w}×{h} px) → Lanczos")
     elif route_reason == "too_large":
         print(f"/upscale_image: subject too large ({w}×{h} px) → Lanczos")
 
