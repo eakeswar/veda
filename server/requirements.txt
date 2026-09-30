@@ -1,7 +1,27 @@
+# Laptop backend — install into server/vendor (not globally):
+#   python -m pip install --target server/vendor -r server/requirements.txt
+#
+# Then install CPU PyTorch (required for local NLLB translation fallback):
+#   python -m pip install --target server/vendor torch --index-url https://download.pytorch.org/whl/cpu
+#
+# pdfminer.six (pulled in by pdfplumber) also needs cryptography + cffi.
+# If layout extraction fails, install those system-wide:
+#   python -m pip install cryptography cffi
+
 edge-tts==7.2.8
 fastapi
-uvicorn
+uvicorn[standard]
 python-dotenv
+python-multipart
+requests
+httpx
 openai
 elevenlabs
-
+pymupdf
+pdfplumber
+Pillow
+opencv-python-headless
+llama-cpp-python
+transformers
+sentencepiece
+sacremoses
