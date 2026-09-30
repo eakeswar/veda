@@ -33,13 +33,14 @@ After a fresh clone you recreate `server/.env` from `server/.env.example` and pa
 
 **In the repo (clone this):** source (`src/`, `server/*.py`, Kaggle scripts, notebook), `package.json` / lockfile, `server/requirements.txt`, `.env.example` files, YuNet ONNX (`server/data/face_detection_yunet_2023mar.onnx`), docs, `.cursorrules`.
 
-**Not in git (recreate after clone):**
+**Not in git (GitHub rejects files over 100 MB):** Qwen GGUF (~0.5–4 GB) and NLLB (~2.5 GB) cannot be pushed. YuNet face weights **are** in git (`server/data/*.onnx`).
 
 | Path | How to restore |
 |------|----------------|
 | `node_modules/` | `npm install` |
 | `server/vendor/` | `pip install --target server/vendor ...` |
-| `server/models/*.gguf` | Auto-download on first local analyze, or download 7B for Kaggle publish |
+| `server/models/*.gguf` | `python server/download_local_models.py` (or `setup.ps1`) |
+| HuggingFace NLLB cache | `python server/download_local_models.py --nllb` |
 | `server/.env` | Copy from `server/.env.example` |
 | Root `.env` | Optional; copy from `.env.example` |
 | `server/active_doc.pdf` | Created when you upload a PDF |
@@ -67,15 +68,24 @@ git clone https://github.com/eakeswar/veda.git
 cd veda
 ```
 
-### 2. Frontend
+### 2. One command (packages + Qwen GGUF + NLLB)
+
+This installs npm deps, `server/vendor`, CPU PyTorch, then downloads the local Qwen GGUF (default **3B**, from `LOCAL_LLM_SIZE`) and **NLLB-200 1.3B**. Several GB; needs disk space and a stable network.
 
 ```powershell
-npm install
+powershell -ExecutionPolicy Bypass -File .\setup.ps1
+```
+
+To match a small laptop that only used **0.5B**, set that before download:
+
+```powershell
+$env:LOCAL_LLM_SIZE="0.5B"
+python server\download_local_models.py --nllb
 ```
 
 Optional: `copy .env.example .env` (only if you need to change `VITE_API_BASE_URL`).
 
-### 3. Backend Python packages
+### 3. Backend Python packages (if you skip setup.ps1)
 
 Always install into **`server/vendor`** (this project does not use a global site-packages install for app deps):
 
@@ -128,7 +138,7 @@ npm run dev
 
 Open **http://localhost:5173**. Check **http://127.0.0.1:8765/health**.
 
-The first **Analyze** on laptop downloads **Qwen 2.5 3B GGUF** into `server/models/` (a few GB). Local NLLB-200 1.3B also downloads from HuggingFace on first Telugu translate if Kaggle is off.
+If you already ran `setup.ps1`, Qwen and NLLB are on disk. Otherwise the first **Analyze** still downloads the local GGUF, and the first Telugu translate downloads NLLB.
 
 ---
 
