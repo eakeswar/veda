@@ -262,6 +262,7 @@ python server/test_kaggle.py --translate-trial
 ```
 veda/
 ├── .cursorrules                 # Full architecture + incidents
+├── setup.ps1                    # npm + vendor + Qwen GGUF + NLLB
 ├── README.md                    # This setup guide
 ├── docs/                        # Internship report
 ├── package.json                 # React / Vite / Tailwind
@@ -272,6 +273,7 @@ veda/
 │   ├── context/PDFContext.jsx
 │   └── utils/                   # pdfUtils, speechUtils, exportPageHtml
 └── server/
+    ├── download_local_models.py # Qwen GGUF (+ optional NLLB / 7B)
     ├── tts_server.py            # Orchestrator :8765
     ├── requirements.txt
     ├── .env.example
